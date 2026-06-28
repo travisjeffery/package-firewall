@@ -1,0 +1,12 @@
+services:
+  package-firewall:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./configs/package-firewall.example.yml:/app/package-firewall.yml:ro
+      - ./configs/policy.example.yml:/app/policy.example.yml:ro
+    environment:
+      PFW_LISTEN_ADDR: ":8080"
+    restart: unless-stopped

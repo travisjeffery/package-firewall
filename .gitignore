@@ -1,0 +1,7 @@
+.DS_Store
+.env
+/bin/
+/dist/
+/coverage.out
+/package-firewall
+/pfw

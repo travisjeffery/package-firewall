@@ -1,0 +1,51 @@
+server:
+  listen_addr: ":8080"
+  read_timeout: 30s
+  write_timeout: 0s
+  shutdown_timeout: 10s
+  public_base_url: "http://localhost:8080"
+
+auth:
+  bearer_token_env: ""
+  basic_username_env: ""
+  basic_password_env: ""
+
+decision:
+  fail_open_intel_errors: true
+  fail_open_unknown_package: true
+  vulnerability_block_threshold: 9.0
+  default_vulnerability_action: warn
+
+intel:
+  osv:
+    enabled: true
+    api_url: "https://api.osv.dev/v1/query"
+    timeout: 8s
+    cache_ttl: 6h
+
+policy:
+  files:
+    - "policy.example.yml"
+
+routes:
+  - name: npm
+    ecosystem: npm
+    path_prefix: /npm/
+    upstream_url: https://registry.npmjs.org/
+    cache_ttl: 10m
+  - name: pypi
+    ecosystem: pypi
+    path_prefix: /pypi/
+    upstream_url: https://pypi.org/
+    file_upstream_url: https://files.pythonhosted.org/
+    cache_ttl: 10m
+  - name: maven
+    ecosystem: maven
+    path_prefix: /maven/
+    upstream_url: https://repo1.maven.org/maven2/
+    cache_ttl: 10m
+  - name: go
+    ecosystem: go
+    path_prefix: /go/
+    upstream_url: https://proxy.golang.org/
+    cache_ttl: 10m

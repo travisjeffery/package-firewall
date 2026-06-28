@@ -1,0 +1,13 @@
+deny:
+  - "pkg:npm/lodahs@*"
+  - "pkg:pypi/requestz@*"
+
+warn:
+  - "pkg:npm/left-pad@*"
+
+allow:
+  - "pkg:golang/golang.org/x/mod@v0.30.0"
+
+cooldown:
+  enabled: false
+  min_age: 24h

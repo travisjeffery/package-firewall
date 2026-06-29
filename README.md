@@ -88,6 +88,19 @@ docker build -t package-firewall .
 docker compose up
 ```
 
+## CI Image Build
+
+CI runs Go tests, `go vet`, and an arm64 Docker image build. On pushes to
+`main`, it can also publish to ECR when these repository variables are set:
+
+- `AWS_ROLE_ARN`
+- `AWS_REGION`
+- `ECR_REGISTRY`
+- `ECR_REPOSITORY`
+
+The control-plane Kubernetes deployment lives in the backend `control` Helm
+chart, not in this repository.
+
 ## Live Smoke Tests
 
 The default unit test suite does not hit public registries. To verify the

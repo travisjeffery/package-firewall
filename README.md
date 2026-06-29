@@ -88,6 +88,30 @@ docker build -t package-firewall .
 docker compose up
 ```
 
+## Live Smoke Tests
+
+The default unit test suite does not hit public registries. To verify the
+firewall against real package-manager downloads, run:
+
+```bash
+./scripts/live-smoke.sh
+```
+
+This starts a temporary local firewall and fetches pinned Kubernetes-related
+dependencies through it:
+
+- npm: `@kubernetes/client-node@0.22.3`
+- PyPI: `kubernetes==29.0.0`
+- Go: `k8s.io/apimachinery@v0.30.0`
+- Maven: `io.kubernetes:client-java:21.0.2` POM over the Maven route
+
+The test uses temporary package-manager caches and does not modify global npm,
+pip, Go, Maven, or Gradle configuration.
+
+It also starts a second firewall instance with a test-only deny policy and
+verifies that `pkg:maven/io.kubernetes/client-java@21.0.2` returns `403` instead
+of reaching Maven Central.
+
 ## Configuration
 
 See `configs/package-firewall.example.yml`.

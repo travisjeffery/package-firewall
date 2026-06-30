@@ -15,6 +15,11 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/policy"
 )
 
+const (
+	maxOSVResponseBytes = 4 << 20
+	maxOSVFindings      = 1024
+)
+
 type OSVProvider struct {
 	apiURL string
 	client *http.Client
@@ -64,8 +69,8 @@ func (p *OSVProvider) Query(ctx context.Context, pkg policy.Package) (Result, er
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return Result{}, fmt.Errorf("osv returned %d: %s", resp.StatusCode, strings.TrimSpace(string(limited)))
 	}
-	var decoded osvResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	decoded, err := decodeOSVResponse(resp.Body)
+	if err != nil {
 		return Result{}, err
 	}
 	result := Result{Findings: make([]Finding, 0, len(decoded.Vulns))}
@@ -78,6 +83,24 @@ func (p *OSVProvider) Query(ctx context.Context, pkg policy.Package) (Result, er
 	}
 	p.cache.Set(key, result, p.ttl)
 	return result, nil
+}
+
+func decodeOSVResponse(body io.Reader) (osvResponse, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxOSVResponseBytes+1))
+	if err != nil {
+		return osvResponse{}, err
+	}
+	if len(raw) > maxOSVResponseBytes {
+		return osvResponse{}, fmt.Errorf("osv response exceeds %d bytes", maxOSVResponseBytes)
+	}
+	var decoded osvResponse
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return osvResponse{}, err
+	}
+	if len(decoded.Vulns) > maxOSVFindings {
+		return osvResponse{}, fmt.Errorf("osv response contains %d vulnerabilities, max %d", len(decoded.Vulns), maxOSVFindings)
+	}
+	return decoded, nil
 }
 
 func osvPackage(pkg policy.Package) (string, string) {

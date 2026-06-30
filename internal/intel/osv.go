@@ -11,6 +11,10 @@ import (
 	"strings"
 	"time"
 
+	gocvss20 "github.com/pandatix/go-cvss/20"
+	gocvss30 "github.com/pandatix/go-cvss/30"
+	gocvss31 "github.com/pandatix/go-cvss/31"
+	gocvss40 "github.com/pandatix/go-cvss/40"
 	"github.com/travisjeffery/package-firewall/internal/cache"
 	"github.com/travisjeffery/package-firewall/internal/policy"
 )
@@ -98,18 +102,48 @@ func osvPackage(pkg policy.Package) (string, string) {
 func maxSeverity(items []osvSeverity) float64 {
 	var max float64
 	for _, item := range items {
-		if strings.HasPrefix(strings.ToUpper(item.Type), "CVSS") {
-			score := item.Score
-			if idx := strings.LastIndex(score, "/"); idx >= 0 {
-				score = score[idx+1:]
-			}
-			parsed, err := strconv.ParseFloat(score, 64)
-			if err == nil && parsed > max {
-				max = parsed
-			}
+		if score := severityScore(item.Score); score > max {
+			max = score
 		}
 	}
 	return max
+}
+
+// severityScore resolves an OSV severity entry to a numeric CVSS base score.
+//
+// OSV reports severity as a CVSS *vector string* (e.g.
+// "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H"), not a bare number, so the
+// base score must be computed from the vector. We also accept an already-numeric
+// score for providers that report one. Anything we cannot parse yields 0 so the
+// caller falls back to the configured default action rather than mis-blocking.
+func severityScore(raw string) float64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if parsed, err := strconv.ParseFloat(raw, 64); err == nil {
+		return parsed
+	}
+	switch {
+	case strings.HasPrefix(raw, "CVSS:3.0"):
+		if c, err := gocvss30.ParseVector(raw); err == nil {
+			return c.BaseScore()
+		}
+	case strings.HasPrefix(raw, "CVSS:3.1"):
+		if c, err := gocvss31.ParseVector(raw); err == nil {
+			return c.BaseScore()
+		}
+	case strings.HasPrefix(raw, "CVSS:4.0"):
+		if c, err := gocvss40.ParseVector(raw); err == nil {
+			return c.Score()
+		}
+	default:
+		// CVSS v2 vectors carry no "CVSS:" version prefix.
+		if c, err := gocvss20.ParseVector(raw); err == nil {
+			return c.BaseScore()
+		}
+	}
+	return 0
 }
 
 type osvQuery struct {

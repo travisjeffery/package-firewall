@@ -73,7 +73,7 @@ func Default() Config {
 		Server: ServerConfig{
 			ListenAddr:      ":8080",
 			ReadTimeout:     Duration(30 * time.Second),
-			WriteTimeout:    0,
+			WriteTimeout:    Duration(10 * time.Minute),
 			ShutdownTimeout: Duration(10 * time.Second),
 			PublicBaseURL:   "http://localhost:8080",
 		},
@@ -159,6 +159,9 @@ func (cfg Config) Validate() error {
 	var errs []error
 	if strings.TrimSpace(cfg.Server.ListenAddr) == "" {
 		errs = append(errs, errors.New("server.listen_addr is required"))
+	}
+	if cfg.Server.WriteTimeout <= 0 {
+		errs = append(errs, errors.New("server.write_timeout must be positive"))
 	}
 	if _, err := url.ParseRequestURI(cfg.Server.PublicBaseURL); err != nil {
 		errs = append(errs, fmt.Errorf("server.public_base_url is invalid: %w", err))

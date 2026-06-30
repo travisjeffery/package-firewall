@@ -38,9 +38,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 	if err != nil {
 		return Result{}, err
 	}
-	copyHeaders(req.Header, r.Header)
-	req.Header.Del("Authorization")
-	req.Header.Del("Proxy-Authorization")
+	copyRequestHeaders(req.Header, r.Header)
 	if route.UpstreamTokenEnv != "" {
 		if token := os.Getenv(route.UpstreamTokenEnv); token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
@@ -51,7 +49,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 		return Result{}, err
 	}
 	defer resp.Body.Close()
-	copyHeaders(w.Header(), resp.Header)
+	copyResponseHeaders(w.Header(), resp.Header)
 	rewrite := p.shouldRewrite(route, resp)
 	if rewrite {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
@@ -108,14 +106,39 @@ func (p *Proxy) rewriteBody(route config.RouteConfig, body []byte) []byte {
 	}
 }
 
-func copyHeaders(dst, src http.Header) {
+func copyRequestHeaders(dst, src http.Header) {
+	copyHeaders(dst, src, sensitiveRequestHeader)
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	copyHeaders(dst, src, func(string) bool { return false })
+}
+
+func copyHeaders(dst, src http.Header, skip func(string) bool) {
 	for key, values := range src {
-		if hopByHop(key) {
+		if hopByHop(key) || skip(key) {
 			continue
 		}
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+}
+
+func sensitiveRequestHeader(header string) bool {
+	switch strings.ToLower(header) {
+	case "authorization",
+		"proxy-authorization",
+		"cookie",
+		"cf-access-jwt-assertion",
+		"x-amzn-oidc-data",
+		"x-amzn-oidc-accesstoken",
+		"x-auth-request-access-token",
+		"x-auth-request-email",
+		"x-forwarded-access-token":
+		return true
+	default:
+		return false
 	}
 }
 

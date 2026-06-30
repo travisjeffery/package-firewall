@@ -166,6 +166,22 @@ func (cfg Config) Validate() error {
 	if cfg.Decision.DefaultVulnerabilityAction != "warn" && cfg.Decision.DefaultVulnerabilityAction != "block" && cfg.Decision.DefaultVulnerabilityAction != "monitor" {
 		errs = append(errs, errors.New("decision.default_vulnerability_action must be warn, block, or monitor"))
 	}
+	if cfg.Auth.BearerTokenEnv != "" {
+		if value, ok := os.LookupEnv(cfg.Auth.BearerTokenEnv); !ok || value == "" {
+			errs = append(errs, fmt.Errorf("auth.bearer_token_env %q is not set or is empty", cfg.Auth.BearerTokenEnv))
+		}
+	}
+	if (cfg.Auth.BasicUsernameEnv == "") != (cfg.Auth.BasicPasswordEnv == "") {
+		errs = append(errs, errors.New("auth.basic_username_env and auth.basic_password_env must be set together"))
+	}
+	if cfg.Auth.BasicUsernameEnv != "" {
+		if value, ok := os.LookupEnv(cfg.Auth.BasicUsernameEnv); !ok || value == "" {
+			errs = append(errs, fmt.Errorf("auth.basic_username_env %q is not set or is empty", cfg.Auth.BasicUsernameEnv))
+		}
+		if value, ok := os.LookupEnv(cfg.Auth.BasicPasswordEnv); !ok || value == "" {
+			errs = append(errs, fmt.Errorf("auth.basic_password_env %q is not set or is empty", cfg.Auth.BasicPasswordEnv))
+		}
+	}
 	if cfg.Intel.OSV.Enabled {
 		if _, err := url.ParseRequestURI(cfg.Intel.OSV.APIURL); err != nil {
 			errs = append(errs, fmt.Errorf("intel.osv.api_url is invalid: %w", err))

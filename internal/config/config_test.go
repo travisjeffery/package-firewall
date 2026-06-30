@@ -40,3 +40,49 @@ policy:
 		t.Fatalf("policy path = %q", cfg.Policy.Files[0])
 	}
 }
+
+func TestLoadRejectsMissingConfiguredAuthSecrets(t *testing.T) {
+	_ = os.Unsetenv("PFW_TEST_BEARER_TOKEN")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	err := os.WriteFile(path, []byte(`
+server:
+  public_base_url: "http://example.test"
+auth:
+  bearer_token_env: PFW_TEST_BEARER_TOKEN
+routes:
+  - name: npm
+    ecosystem: npm
+    path_prefix: /npm/
+    upstream_url: https://registry.npmjs.org/
+`), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load succeeded with configured missing bearer secret")
+	}
+}
+
+func TestLoadRejectsPartialBasicAuthSecretConfig(t *testing.T) {
+	t.Setenv("PFW_TEST_BASIC_USER", "alice")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yml")
+	err := os.WriteFile(path, []byte(`
+server:
+  public_base_url: "http://example.test"
+auth:
+  basic_username_env: PFW_TEST_BASIC_USER
+routes:
+  - name: npm
+    ecosystem: npm
+    path_prefix: /npm/
+    upstream_url: https://registry.npmjs.org/
+`), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load succeeded with partial basic auth config")
+	}
+}

@@ -12,6 +12,16 @@ func TestIdentifyNPMTarball(t *testing.T) {
 	}
 }
 
+func TestIdentifyNPMTarballWithPrereleaseAndBuildMetadata(t *testing.T) {
+	info := Identify(Route{Ecosystem: "npm", PathPrefix: "/npm/"}, "/npm/pkg/-/pkg-1.2.3-beta.1+build.7.tgz")
+	if info.Package.PURL != "pkg:npm/pkg@1.2.3-beta.1+build.7" {
+		t.Fatalf("purl = %q", info.Package.PURL)
+	}
+	if !info.NeedsDecision {
+		t.Fatal("expected decision")
+	}
+}
+
 func TestIdentifyPyPIWheel(t *testing.T) {
 	info := Identify(Route{Ecosystem: "pypi", PathPrefix: "/pypi/"}, "/pypi/files/packages/Django-5.0.6-py3-none-any.whl")
 	if info.Package.PURL != "pkg:pypi/django@5.0.6" {

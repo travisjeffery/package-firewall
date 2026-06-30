@@ -33,3 +33,34 @@ func TestProxyRewritesPyPIFileURLs(t *testing.T) {
 		t.Fatalf("body was not rewritten: %s", rec.Body.String())
 	}
 }
+
+func TestUpstreamURLRejectsUnsafePathSegments(t *testing.T) {
+	route := config.RouteConfig{UpstreamURL: "https://registry.example/repository/npm/"}
+	for _, upstreamPath := range []string{
+		"/../admin",
+		"/../../admin",
+		"/%2e%2e/admin",
+		"/%2E%2E/admin",
+		"/safe/%2f/admin",
+	} {
+		t.Run(upstreamPath, func(t *testing.T) {
+			if _, err := upstreamURL(route, registry.RequestInfo{UpstreamPath: upstreamPath}); err == nil {
+				t.Fatal("expected unsafe upstream path to be rejected")
+			}
+		})
+	}
+}
+
+func TestUpstreamURLPreservesSafeRouteBasePath(t *testing.T) {
+	got, err := upstreamURL(
+		config.RouteConfig{UpstreamURL: "https://registry.example/repository/npm/"},
+		registry.RequestInfo{UpstreamPath: "/pkg/-/pkg-1.0.0.tgz"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://registry.example/repository/npm/pkg/-/pkg-1.0.0.tgz"
+	if got != want {
+		t.Fatalf("upstream URL = %q want %q", got, want)
+	}
+}

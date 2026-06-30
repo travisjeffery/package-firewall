@@ -79,9 +79,29 @@ func upstreamURL(route config.RouteConfig, info registry.RequestInfo) (string, e
 		return "", err
 	}
 	prefix := strings.TrimRight(base.Path, "/")
-	path := "/" + strings.TrimLeft(info.UpstreamPath, "/")
+	path, err := safeUpstreamPath(info.UpstreamPath)
+	if err != nil {
+		return "", err
+	}
 	base.Path = prefix + path
 	return base.String(), nil
+}
+
+func safeUpstreamPath(value string) (string, error) {
+	path := "/" + strings.TrimLeft(value, "/")
+	for _, part := range strings.Split(path, "/") {
+		if part == "" {
+			continue
+		}
+		decoded, err := url.PathUnescape(part)
+		if err != nil {
+			return "", err
+		}
+		if part == "." || part == ".." || decoded == "." || decoded == ".." || strings.ContainsAny(decoded, `/\`) {
+			return "", fmt.Errorf("upstream path contains unsafe segment %q", part)
+		}
+	}
+	return path, nil
 }
 
 func (p *Proxy) shouldRewrite(route config.RouteConfig, resp *http.Response) bool {

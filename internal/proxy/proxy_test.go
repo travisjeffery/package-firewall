@@ -33,3 +33,63 @@ func TestProxyRewritesPyPIFileURLs(t *testing.T) {
 		t.Fatalf("body was not rewritten: %s", rec.Body.String())
 	}
 }
+
+func TestProxyStripsSensitiveRequestHeaders(t *testing.T) {
+	var seen http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{
+		Ecosystem:   "npm",
+		PathPrefix:  "/npm/",
+		UpstreamURL: upstream.URL + "/",
+	}
+	req := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+	req.Header.Set("Authorization", "Bearer client")
+	req.Header.Set("Cookie", "session=secret")
+	req.Header.Set("Cf-Access-Jwt-Assertion", "jwt")
+	req.Header.Set("X-Amzn-Oidc-Data", "oidc")
+	req.Header.Set("X-Forwarded-Access-Token", "token")
+	req.Header.Set("Accept", "application/octet-stream")
+	_, err := p.Serve(httptest.NewRecorder(), req, route, registry.RequestInfo{UpstreamPath: "/pkg/-/pkg-1.0.0.tgz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, header := range []string{"Authorization", "Cookie", "Cf-Access-Jwt-Assertion", "X-Amzn-Oidc-Data", "X-Forwarded-Access-Token"} {
+		if got := seen.Get(header); got != "" {
+			t.Fatalf("%s reached upstream as %q", header, got)
+		}
+	}
+	if got := seen.Get("Accept"); got != "application/octet-stream" {
+		t.Fatalf("Accept = %q", got)
+	}
+}
+
+func TestProxyUsesConfiguredUpstreamTokenAfterStrippingClientAuth(t *testing.T) {
+	t.Setenv("PFW_TEST_UPSTREAM_TOKEN", "upstream-secret")
+	var auth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{
+		Ecosystem:        "npm",
+		PathPrefix:       "/npm/",
+		UpstreamURL:      upstream.URL + "/",
+		UpstreamTokenEnv: "PFW_TEST_UPSTREAM_TOKEN",
+	}
+	req := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+	req.Header.Set("Authorization", "Bearer client")
+	_, err := p.Serve(httptest.NewRecorder(), req, route, registry.RequestInfo{UpstreamPath: "/pkg/-/pkg-1.0.0.tgz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth != "Bearer upstream-secret" {
+		t.Fatalf("Authorization = %q", auth)
+	}
+}

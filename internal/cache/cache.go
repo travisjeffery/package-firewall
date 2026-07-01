@@ -6,8 +6,10 @@ import (
 )
 
 type Cache[T any] struct {
-	mu    sync.Mutex
-	items map[string]entry[T]
+	mu         sync.Mutex
+	items      map[string]entry[T]
+	order      []string
+	maxEntries int
 }
 
 type entry[T any] struct {
@@ -16,7 +18,11 @@ type entry[T any] struct {
 }
 
 func New[T any]() *Cache[T] {
-	return &Cache[T]{items: map[string]entry[T]{}}
+	return NewWithMaxEntries[T](0)
+}
+
+func NewWithMaxEntries[T any](maxEntries int) *Cache[T] {
+	return &Cache[T]{items: map[string]entry[T]{}, maxEntries: maxEntries}
 }
 
 func (c *Cache[T]) Get(key string) (T, bool) {
@@ -41,11 +47,27 @@ func (c *Cache[T]) Set(key string, value T, ttl time.Duration) {
 	if ttl > 0 {
 		item.expiresAt = time.Now().Add(ttl)
 	}
+	if _, ok := c.items[key]; !ok {
+		c.order = append(c.order, key)
+	}
 	c.items[key] = item
+	c.enforceMaxEntries()
 }
 
 func (c *Cache[T]) Purge() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.items = map[string]entry[T]{}
+	c.order = nil
+}
+
+func (c *Cache[T]) enforceMaxEntries() {
+	if c.maxEntries <= 0 {
+		return
+	}
+	for len(c.items) > c.maxEntries && len(c.order) > 0 {
+		key := c.order[0]
+		c.order = c.order[1:]
+		delete(c.items, key)
+	}
 }

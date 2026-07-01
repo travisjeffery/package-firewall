@@ -15,6 +15,8 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/policy"
 )
 
+const defaultOSVCacheEntries = 4096
+
 type OSVProvider struct {
 	apiURL string
 	client *http.Client
@@ -26,7 +28,7 @@ func NewOSVProvider(apiURL string, timeout time.Duration, ttl time.Duration) *OS
 	return &OSVProvider{
 		apiURL: apiURL,
 		client: &http.Client{Timeout: timeout},
-		cache:  cache.New[Result](),
+		cache:  cache.NewWithMaxEntries[Result](defaultOSVCacheEntries),
 		ttl:    ttl,
 	}
 }

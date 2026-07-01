@@ -22,6 +22,19 @@ func TestIdentifyNPMTarballWithPrereleaseAndBuildMetadata(t *testing.T) {
 	}
 }
 
+func TestIdentifyNPMUnparsedTarballRequiresDecision(t *testing.T) {
+	info := Identify(Route{Ecosystem: "npm", PathPrefix: "/npm/"}, "/npm/pkg/-/pkg-not-a-semver.tgz")
+	if info.Kind != "artifact" {
+		t.Fatalf("kind = %q", info.Kind)
+	}
+	if info.Package.PURL != "" {
+		t.Fatalf("purl = %q", info.Package.PURL)
+	}
+	if !info.NeedsDecision {
+		t.Fatal("expected decision for unparsed artifact")
+	}
+}
+
 func TestIdentifyPyPIWheel(t *testing.T) {
 	info := Identify(Route{Ecosystem: "pypi", PathPrefix: "/pypi/"}, "/pypi/files/packages/Django-5.0.6-py3-none-any.whl")
 	if info.Package.PURL != "pkg:pypi/django@5.0.6" {

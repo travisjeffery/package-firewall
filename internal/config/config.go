@@ -16,6 +16,7 @@ import (
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Auth     AuthConfig     `yaml:"auth"`
+	Cache    CacheConfig    `yaml:"cache"`
 	Decision DecisionConfig `yaml:"decision"`
 	Intel    IntelConfig    `yaml:"intel"`
 	Policy   PolicyConfig   `yaml:"policy"`
@@ -34,6 +35,24 @@ type AuthConfig struct {
 	BearerTokenEnv   string `yaml:"bearer_token_env"`
 	BasicUsernameEnv string `yaml:"basic_username_env"`
 	BasicPasswordEnv string `yaml:"basic_password_env"`
+}
+
+type CacheConfig struct {
+	Backend              string         `yaml:"backend"`
+	S3                   S3CacheConfig  `yaml:"s3"`
+	DynamoDB             DDBCacheConfig `yaml:"dynamodb"`
+	ArtifactTTL          Duration       `yaml:"artifact_ttl"`
+	ArtifactStaleIfError Duration       `yaml:"artifact_stale_if_error"`
+	MaxObjectSize        int64          `yaml:"max_object_size"`
+}
+
+type S3CacheConfig struct {
+	Bucket string `yaml:"bucket"`
+	Prefix string `yaml:"prefix"`
+}
+
+type DDBCacheConfig struct {
+	Table string `yaml:"table"`
 }
 
 type DecisionConfig struct {
@@ -76,6 +95,12 @@ func Default() Config {
 			WriteTimeout:    0,
 			ShutdownTimeout: Duration(10 * time.Second),
 			PublicBaseURL:   "http://localhost:8080",
+		},
+		Cache: CacheConfig{
+			Backend:              "none",
+			ArtifactTTL:          Duration(24 * time.Hour),
+			ArtifactStaleIfError: Duration(30 * 24 * time.Hour),
+			MaxObjectSize:        512 << 20,
 		},
 		Decision: DecisionConfig{
 			FailOpenIntelErrors:         true,
@@ -145,6 +170,18 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("PFW_OSV_API_URL"); v != "" {
 		cfg.Intel.OSV.APIURL = v
 	}
+	if v := os.Getenv("PFW_CACHE_BACKEND"); v != "" {
+		cfg.Cache.Backend = v
+	}
+	if v := os.Getenv("PFW_CACHE_S3_BUCKET"); v != "" {
+		cfg.Cache.S3.Bucket = v
+	}
+	if v := os.Getenv("PFW_CACHE_S3_PREFIX"); v != "" {
+		cfg.Cache.S3.Prefix = v
+	}
+	if v := os.Getenv("PFW_CACHE_DYNAMODB_TABLE"); v != "" {
+		cfg.Cache.DynamoDB.Table = v
+	}
 }
 
 func parseBool(value string, fallback bool) bool {
@@ -165,6 +202,27 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.Decision.DefaultVulnerabilityAction != "warn" && cfg.Decision.DefaultVulnerabilityAction != "block" && cfg.Decision.DefaultVulnerabilityAction != "monitor" {
 		errs = append(errs, errors.New("decision.default_vulnerability_action must be warn, block, or monitor"))
+	}
+	switch cfg.Cache.Backend {
+	case "", "none":
+	case "s3_dynamodb":
+		if strings.TrimSpace(cfg.Cache.S3.Bucket) == "" {
+			errs = append(errs, errors.New("cache.s3.bucket is required when cache.backend=s3_dynamodb"))
+		}
+		if strings.TrimSpace(cfg.Cache.DynamoDB.Table) == "" {
+			errs = append(errs, errors.New("cache.dynamodb.table is required when cache.backend=s3_dynamodb"))
+		}
+		if cfg.Cache.ArtifactTTL <= 0 {
+			errs = append(errs, errors.New("cache.artifact_ttl must be positive"))
+		}
+		if cfg.Cache.ArtifactStaleIfError < 0 {
+			errs = append(errs, errors.New("cache.artifact_stale_if_error cannot be negative"))
+		}
+		if cfg.Cache.MaxObjectSize <= 0 {
+			errs = append(errs, errors.New("cache.max_object_size must be positive"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("cache.backend %q is unsupported", cfg.Cache.Backend))
 	}
 	if cfg.Intel.OSV.Enabled {
 		if _, err := url.ParseRequestURI(cfg.Intel.OSV.APIURL); err != nil {

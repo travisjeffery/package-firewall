@@ -10,6 +10,19 @@ auth:
   basic_username_env: ""
   basic_password_env: ""
 
+cache:
+  # "none" keeps package-firewall as a streaming policy proxy. "s3_dynamodb"
+  # enables durable artifact shielding with S3 bodies and DynamoDB metadata.
+  backend: "none"
+  s3:
+    bucket: ""
+    prefix: "package-firewall"
+  dynamodb:
+    table: ""
+  artifact_ttl: 24h
+  artifact_stale_if_error: 720h
+  max_object_size: 536870912
+
 decision:
   fail_open_intel_errors: true
   fail_open_unknown_package: true

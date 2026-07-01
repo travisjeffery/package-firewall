@@ -34,7 +34,7 @@ type Server struct {
 	basicPass string
 }
 
-func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider) *Server {
+func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfig ...proxy.CacheConfig) *Server {
 	routes := append([]config.RouteConfig(nil), cfg.Routes...)
 	sort.Slice(routes, func(i, j int) bool {
 		return len(routes[i].PathPrefix) > len(routes[j].PathPrefix)
@@ -46,7 +46,7 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 		cfg:       cfg,
 		policy:    policyEngine,
 		intel:     provider,
-		proxy:     proxy.New(cfg.Server.PublicBaseURL),
+		proxy:     proxy.New(cfg.Server.PublicBaseURL, cacheConfig...),
 		audit:     audit.New(),
 		logger:    slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 		routes:    routes,
@@ -233,8 +233,8 @@ func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-func Run(ctx context.Context, cfg config.Config, policyEngine *policy.Engine, provider intel.Provider) error {
-	srv := New(cfg, policyEngine, provider).HTTPServer()
+func Run(ctx context.Context, cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfig ...proxy.CacheConfig) error {
+	srv := New(cfg, policyEngine, provider, cacheConfig...).HTTPServer()
 	errCh := make(chan error, 1)
 	go func() {
 		err := srv.ListenAndServe()

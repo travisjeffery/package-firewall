@@ -133,8 +133,21 @@ Important settings:
 
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
+- `cache.backend`: set to `s3_dynamodb` to cache exact-version package artifacts in S3 with DynamoDB metadata; the default `none` keeps package-firewall as a streaming proxy.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
 - `auth.bearer_token_env` and `auth.basic_*_env`: require clients to authenticate to the firewall.
+
+## Artifact Shielding
+
+When `cache.backend: s3_dynamodb` is enabled, package-firewall stores successful
+exact-version artifact downloads in S3 and stores freshness metadata in
+DynamoDB. Every request still goes through the normal policy and OSV decision
+path before cached content is served. Fresh cache hits avoid upstream package
+registries; stale exact-version artifacts can be served during upstream errors
+within the configured stale window.
+
+This cache does not yet cache registry metadata or share OSV results across
+replicas.
 
 ## Current Limits
 

@@ -19,7 +19,7 @@ func identifyNPM(route Route, relative string, info RequestInfo) RequestInfo {
 		name := npmNameFromParts(parts[:len(parts)-2])
 		version := npmVersionFromTarball(parts[len(parts)-1])
 		info.Kind = "artifact"
-		info.NeedsDecision = version != ""
+		info.NeedsDecision = true
 		info.Package = policy.Package{
 			Ecosystem: route.Ecosystem,
 			Name:      name,

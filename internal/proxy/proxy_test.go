@@ -82,14 +82,18 @@ func TestProxyStripsSensitiveRequestHeaders(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer client")
 	req.Header.Set("Cookie", "session=secret")
 	req.Header.Set("Cf-Access-Jwt-Assertion", "jwt")
+	req.Header.Set("Cf-Access-Authenticated-User-Email", "alice@example.com")
 	req.Header.Set("X-Amzn-Oidc-Data", "oidc")
+	req.Header.Set("X-Auth-Request-User", "alice")
+	req.Header.Set("X-Forwarded-Email", "alice@example.com")
 	req.Header.Set("X-Forwarded-Access-Token", "token")
+	req.Header.Set("X-Forwarded-User", "alice")
 	req.Header.Set("Accept", "application/octet-stream")
 	_, err := p.Serve(httptest.NewRecorder(), req, route, registry.RequestInfo{UpstreamPath: "/pkg/-/pkg-1.0.0.tgz"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, header := range []string{"Authorization", "Cookie", "Cf-Access-Jwt-Assertion", "X-Amzn-Oidc-Data", "X-Forwarded-Access-Token"} {
+	for _, header := range []string{"Authorization", "Cookie", "Cf-Access-Jwt-Assertion", "Cf-Access-Authenticated-User-Email", "X-Amzn-Oidc-Data", "X-Auth-Request-User", "X-Forwarded-Access-Token", "X-Forwarded-Email", "X-Forwarded-User"} {
 		if got := seen.Get(header); got != "" {
 			t.Fatalf("%s reached upstream as %q", header, got)
 		}

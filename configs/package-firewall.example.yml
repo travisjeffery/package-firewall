@@ -11,9 +11,12 @@ auth:
   basic_password_env: ""
 
 cache:
-  # "none" keeps package-firewall as a streaming policy proxy. "s3_dynamodb"
-  # enables durable artifact shielding with S3 bodies and DynamoDB metadata.
+  # "none" keeps package-firewall as a streaming policy proxy.
+  # "filesystem" enables portable local-disk artifact shielding.
+  # "s3_dynamodb" enables AWS-backed artifact shielding.
   backend: "none"
+  filesystem:
+    directory: ""
   s3:
     bucket: ""
     prefix: "package-firewall"

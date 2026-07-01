@@ -38,12 +38,17 @@ type AuthConfig struct {
 }
 
 type CacheConfig struct {
-	Backend              string         `yaml:"backend"`
-	S3                   S3CacheConfig  `yaml:"s3"`
-	DynamoDB             DDBCacheConfig `yaml:"dynamodb"`
-	ArtifactTTL          Duration       `yaml:"artifact_ttl"`
-	ArtifactStaleIfError Duration       `yaml:"artifact_stale_if_error"`
-	MaxObjectSize        int64          `yaml:"max_object_size"`
+	Backend              string          `yaml:"backend"`
+	Filesystem           FileCacheConfig `yaml:"filesystem"`
+	S3                   S3CacheConfig   `yaml:"s3"`
+	DynamoDB             DDBCacheConfig  `yaml:"dynamodb"`
+	ArtifactTTL          Duration        `yaml:"artifact_ttl"`
+	ArtifactStaleIfError Duration        `yaml:"artifact_stale_if_error"`
+	MaxObjectSize        int64           `yaml:"max_object_size"`
+}
+
+type FileCacheConfig struct {
+	Directory string `yaml:"directory"`
 }
 
 type S3CacheConfig struct {
@@ -173,6 +178,9 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("PFW_CACHE_BACKEND"); v != "" {
 		cfg.Cache.Backend = v
 	}
+	if v := os.Getenv("PFW_CACHE_FILESYSTEM_DIRECTORY"); v != "" {
+		cfg.Cache.Filesystem.Directory = v
+	}
 	if v := os.Getenv("PFW_CACHE_S3_BUCKET"); v != "" {
 		cfg.Cache.S3.Bucket = v
 	}
@@ -205,6 +213,19 @@ func (cfg Config) Validate() error {
 	}
 	switch cfg.Cache.Backend {
 	case "", "none":
+	case "filesystem":
+		if strings.TrimSpace(cfg.Cache.Filesystem.Directory) == "" {
+			errs = append(errs, errors.New("cache.filesystem.directory is required when cache.backend=filesystem"))
+		}
+		if cfg.Cache.ArtifactTTL <= 0 {
+			errs = append(errs, errors.New("cache.artifact_ttl must be positive"))
+		}
+		if cfg.Cache.ArtifactStaleIfError < 0 {
+			errs = append(errs, errors.New("cache.artifact_stale_if_error cannot be negative"))
+		}
+		if cfg.Cache.MaxObjectSize <= 0 {
+			errs = append(errs, errors.New("cache.max_object_size must be positive"))
+		}
 	case "s3_dynamodb":
 		if strings.TrimSpace(cfg.Cache.S3.Bucket) == "" {
 			errs = append(errs, errors.New("cache.s3.bucket is required when cache.backend=s3_dynamodb"))

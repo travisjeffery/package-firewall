@@ -76,9 +76,24 @@ func providerFromConfig(cfg config.Config) intel.Provider {
 }
 
 func cacheFromConfig(ctx context.Context, cfg config.Config) (proxy.CacheConfig, error) {
-	if cfg.Cache.Backend == "" || cfg.Cache.Backend == "none" {
+	switch cfg.Cache.Backend {
+	case "", "none":
 		return proxy.CacheConfig{}, nil
+	case "filesystem":
+		return proxy.CacheConfig{
+			Store:                objectcache.NewFileSystemStore(cfg.Cache.Filesystem.Directory),
+			ArtifactTTL:          cfg.Cache.ArtifactTTL.Std(),
+			ArtifactStaleIfError: cfg.Cache.ArtifactStaleIfError.Std(),
+			MaxObjectSize:        cfg.Cache.MaxObjectSize,
+		}, nil
+	case "s3_dynamodb":
+		return s3DynamoDBCacheFromConfig(ctx, cfg)
+	default:
+		return proxy.CacheConfig{}, fmt.Errorf("unsupported cache backend %q", cfg.Cache.Backend)
 	}
+}
+
+func s3DynamoDBCacheFromConfig(ctx context.Context, cfg config.Config) (proxy.CacheConfig, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return proxy.CacheConfig{}, err

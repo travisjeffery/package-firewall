@@ -72,6 +72,39 @@ func TestServerSupportsNPMRootTarballFallback(t *testing.T) {
 	}
 }
 
+func TestServerBlocksUnparsedPyPIFileWhenUnknownPackagesFailClosed(t *testing.T) {
+	upstreamHit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Decision.FailOpenUnknownPackage = false
+	cfg.Routes = []config.RouteConfig{{
+		Name:            "pypi",
+		Ecosystem:       "pypi",
+		PathPrefix:      "/pypi/",
+		UpstreamURL:     "https://pypi.example/",
+		FileUpstreamURL: upstream.URL + "/",
+	}}
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, engine, intel.NoopProvider{}).routesHandler()
+	req := httptest.NewRequest(http.MethodGet, "/pypi/files/packages/left_pad-not-a-version.whl", nil)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if upstreamHit {
+		t.Fatal("file upstream was called for unparsed pypi artifact")
+	}
+}
+
 func TestRunHealthEndpoint(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.ListenAddr = "127.0.0.1:0"

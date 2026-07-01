@@ -151,11 +151,15 @@ func sensitiveRequestHeader(header string) bool {
 		"proxy-authorization",
 		"cookie",
 		"cf-access-jwt-assertion",
+		"cf-access-authenticated-user-email",
 		"x-amzn-oidc-data",
 		"x-amzn-oidc-accesstoken",
 		"x-auth-request-access-token",
 		"x-auth-request-email",
-		"x-forwarded-access-token":
+		"x-auth-request-user",
+		"x-forwarded-access-token",
+		"x-forwarded-email",
+		"x-forwarded-user":
 		return true
 	default:
 		return false

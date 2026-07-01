@@ -8,7 +8,7 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/policy"
 )
 
-var npmTarballVersionRE = regexp.MustCompile(`^(.+)-(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?)\.tgz$`)
+var npmTarballVersionRE = regexp.MustCompile(`^(.+)-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\.tgz$`)
 
 func identifyNPM(route Route, relative string, info RequestInfo) RequestInfo {
 	parts := splitPath(relative)

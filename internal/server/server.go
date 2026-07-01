@@ -32,6 +32,7 @@ type Server struct {
 	bearer    string
 	basicUser string
 	basicPass string
+	authReady bool
 }
 
 func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfig ...proxy.CacheConfig) *Server {
@@ -42,6 +43,9 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 	if provider == nil {
 		provider = intel.NoopProvider{}
 	}
+	bearer, bearerOK := secretFromEnv(cfg.Auth.BearerTokenEnv)
+	basicUser, basicUserOK := secretFromEnv(cfg.Auth.BasicUsernameEnv)
+	basicPass, basicPassOK := secretFromEnv(cfg.Auth.BasicPasswordEnv)
 	return &Server{
 		cfg:       cfg,
 		policy:    policyEngine,
@@ -50,9 +54,10 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 		audit:     audit.New(),
 		logger:    slog.New(slog.NewJSONHandler(os.Stdout, nil)),
 		routes:    routes,
-		bearer:    secretFromEnv(cfg.Auth.BearerTokenEnv),
-		basicUser: secretFromEnv(cfg.Auth.BasicUsernameEnv),
-		basicPass: secretFromEnv(cfg.Auth.BasicPasswordEnv),
+		bearer:    bearer,
+		basicUser: basicUser,
+		basicPass: basicPass,
+		authReady: bearerOK && basicUserOK && basicPassOK,
 	}
 }
 
@@ -174,6 +179,9 @@ func (s *Server) matchNPMTarballFallback(path string) (config.RouteConfig, bool)
 }
 
 func (s *Server) authorized(r *http.Request) bool {
+	if !s.authReady {
+		return false
+	}
 	if s.bearer == "" && s.basicUser == "" && s.basicPass == "" {
 		return true
 	}
@@ -222,11 +230,15 @@ func errorBody(code string, message string, requestID string) map[string]string 
 	return map[string]string{"error": code, "message": message, "request_id": requestID}
 }
 
-func secretFromEnv(name string) string {
+func secretFromEnv(name string) (string, bool) {
 	if name == "" {
-		return ""
+		return "", true
 	}
-	return os.Getenv(name)
+	value, ok := os.LookupEnv(name)
+	if !ok || value == "" {
+		return "", false
+	}
+	return value, true
 }
 
 func constantTimeEqual(a, b string) bool {

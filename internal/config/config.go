@@ -97,7 +97,7 @@ func Default() Config {
 		Server: ServerConfig{
 			ListenAddr:      ":8080",
 			ReadTimeout:     Duration(30 * time.Second),
-			WriteTimeout:    0,
+			WriteTimeout:    Duration(10 * time.Minute),
 			ShutdownTimeout: Duration(10 * time.Second),
 			PublicBaseURL:   "http://localhost:8080",
 		},
@@ -205,6 +205,9 @@ func (cfg Config) Validate() error {
 	if strings.TrimSpace(cfg.Server.ListenAddr) == "" {
 		errs = append(errs, errors.New("server.listen_addr is required"))
 	}
+	if cfg.Server.WriteTimeout <= 0 {
+		errs = append(errs, errors.New("server.write_timeout must be positive"))
+	}
 	if _, err := url.ParseRequestURI(cfg.Server.PublicBaseURL); err != nil {
 		errs = append(errs, fmt.Errorf("server.public_base_url is invalid: %w", err))
 	}
@@ -244,6 +247,22 @@ func (cfg Config) Validate() error {
 		}
 	default:
 		errs = append(errs, fmt.Errorf("cache.backend %q is unsupported", cfg.Cache.Backend))
+	}
+	if cfg.Auth.BearerTokenEnv != "" {
+		if value, ok := os.LookupEnv(cfg.Auth.BearerTokenEnv); !ok || value == "" {
+			errs = append(errs, fmt.Errorf("auth.bearer_token_env %q is not set or is empty", cfg.Auth.BearerTokenEnv))
+		}
+	}
+	if (cfg.Auth.BasicUsernameEnv == "") != (cfg.Auth.BasicPasswordEnv == "") {
+		errs = append(errs, errors.New("auth.basic_username_env and auth.basic_password_env must be set together"))
+	}
+	if cfg.Auth.BasicUsernameEnv != "" {
+		if value, ok := os.LookupEnv(cfg.Auth.BasicUsernameEnv); !ok || value == "" {
+			errs = append(errs, fmt.Errorf("auth.basic_username_env %q is not set or is empty", cfg.Auth.BasicUsernameEnv))
+		}
+		if value, ok := os.LookupEnv(cfg.Auth.BasicPasswordEnv); !ok || value == "" {
+			errs = append(errs, fmt.Errorf("auth.basic_password_env %q is not set or is empty", cfg.Auth.BasicPasswordEnv))
+		}
 	}
 	if cfg.Intel.OSV.Enabled {
 		if _, err := url.ParseRequestURI(cfg.Intel.OSV.APIURL); err != nil {

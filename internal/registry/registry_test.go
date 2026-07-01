@@ -32,6 +32,22 @@ func TestIdentifyPyPIWheel(t *testing.T) {
 	}
 }
 
+func TestIdentifyPyPIUnparsedFileRequiresDecision(t *testing.T) {
+	info := Identify(Route{Ecosystem: "pypi", PathPrefix: "/pypi/"}, "/pypi/files/packages/left_pad-not-a-version.whl")
+	if info.Kind != "artifact" {
+		t.Fatalf("kind = %q", info.Kind)
+	}
+	if !info.FileUpstream {
+		t.Fatal("expected file upstream")
+	}
+	if info.Package.PURL != "" {
+		t.Fatalf("purl = %q", info.Package.PURL)
+	}
+	if !info.NeedsDecision {
+		t.Fatal("expected decision for unparsed artifact")
+	}
+}
+
 func TestIdentifyMavenArtifact(t *testing.T) {
 	info := Identify(Route{Ecosystem: "maven", PathPrefix: "/maven/"}, "/maven/org/apache/maven/apache-maven/3.8.4/apache-maven-3.8.4-bin.tar.gz")
 	if info.Package.PURL != "pkg:maven/org.apache.maven/apache-maven@3.8.4" {

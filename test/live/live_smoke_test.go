@@ -141,7 +141,7 @@ func writeDenyConfig(t *testing.T, dir string) string {
 	if err := os.WriteFile(configPath, []byte(`server:
   listen_addr: ":0"
   read_timeout: 30s
-  write_timeout: 0s
+  write_timeout: 10m
   shutdown_timeout: 10s
   public_base_url: "http://127.0.0.1"
 

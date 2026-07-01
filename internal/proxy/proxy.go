@@ -8,10 +8,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/config"
 	"github.com/travisjeffery/package-firewall/internal/registry"
 )
+
+const defaultUpstreamTimeout = 30 * time.Second
 
 type Proxy struct {
 	client  *http.Client
@@ -20,7 +23,7 @@ type Proxy struct {
 
 func New(baseURL string) *Proxy {
 	return &Proxy{
-		client:  &http.Client{Timeout: 0},
+		client:  &http.Client{Timeout: defaultUpstreamTimeout},
 		baseURL: strings.TrimRight(baseURL, "/"),
 	}
 }

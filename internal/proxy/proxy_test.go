@@ -5,10 +5,21 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/config"
 	"github.com/travisjeffery/package-firewall/internal/registry"
 )
+
+func TestProxyUsesBoundedUpstreamTimeout(t *testing.T) {
+	p := New("http://firewall.test")
+	if p.client.Timeout <= 0 {
+		t.Fatal("expected upstream client timeout to be bounded")
+	}
+	if p.client.Timeout > time.Minute {
+		t.Fatalf("upstream timeout = %s, expected at most 1m", p.client.Timeout)
+	}
+}
 
 func TestProxyRewritesPyPIFileURLs(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

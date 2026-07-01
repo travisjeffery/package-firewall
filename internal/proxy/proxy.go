@@ -20,7 +20,7 @@ type Proxy struct {
 
 func New(baseURL string) *Proxy {
 	return &Proxy{
-		client:  &http.Client{Timeout: 0},
+		client:  &http.Client{Timeout: 0, CheckRedirect: sameHostRedirect},
 		baseURL: strings.TrimRight(baseURL, "/"),
 	}
 }
@@ -100,6 +100,17 @@ func safeUpstreamPath(value string) (string, error) {
 		}
 	}
 	return path, nil
+}
+
+func sameHostRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	previous := via[len(via)-1].URL
+	if req.URL.Scheme != previous.Scheme || !strings.EqualFold(req.URL.Host, previous.Host) {
+		return fmt.Errorf("upstream redirect to different host %q", req.URL.Host)
+	}
+	return nil
 }
 
 func (p *Proxy) shouldRewrite(route config.RouteConfig, resp *http.Response) bool {

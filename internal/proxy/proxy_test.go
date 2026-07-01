@@ -65,6 +65,65 @@ func TestUpstreamURLPreservesSafeRouteBasePath(t *testing.T) {
 	}
 }
 
+func TestProxyRejectsCrossHostRedirects(t *testing.T) {
+	redirected := false
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, second.URL+"/pkg/-/pkg-1.0.0.tgz", http.StatusFound)
+	}))
+	defer first.Close()
+
+	p := New("http://firewall.test")
+	route := config.RouteConfig{
+		Ecosystem:   "npm",
+		PathPrefix:  "/npm/",
+		UpstreamURL: first.URL + "/",
+	}
+	req := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+	_, err := p.Serve(httptest.NewRecorder(), req, route, registry.RequestInfo{UpstreamPath: "/pkg/-/pkg-1.0.0.tgz"})
+	if err == nil {
+		t.Fatal("expected cross-host redirect to fail")
+	}
+	if redirected {
+		t.Fatal("cross-host redirect target was reached")
+	}
+}
+
+func TestProxyAllowsSameHostRedirects(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/pkg":
+			http.Redirect(w, r, "/pkg-final", http.StatusFound)
+		case "/pkg-final":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		default:
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+
+	p := New("http://firewall.test")
+	route := config.RouteConfig{
+		Ecosystem:   "npm",
+		PathPrefix:  "/npm/",
+		UpstreamURL: upstream.URL + "/",
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/npm/pkg", nil)
+	_, err := p.Serve(rec, req, route, registry.RequestInfo{UpstreamPath: "/pkg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyStripsSensitiveRequestHeaders(t *testing.T) {
 	var seen http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

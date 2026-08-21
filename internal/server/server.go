@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/audit"
+	"github.com/travisjeffery/package-firewall/internal/cachemetrics"
 	"github.com/travisjeffery/package-firewall/internal/config"
 	"github.com/travisjeffery/package-firewall/internal/intel"
 	"github.com/travisjeffery/package-firewall/internal/policy"
@@ -26,6 +27,7 @@ type Server struct {
 	policy    *policy.Engine
 	intel     intel.Provider
 	proxy     *proxy.Proxy
+	metrics   *cachemetrics.Metrics
 	audit     *audit.Logger
 	logger    *slog.Logger
 	routes    []config.RouteConfig
@@ -35,7 +37,7 @@ type Server struct {
 	authReady bool
 }
 
-func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider) *Server {
+func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfigs ...proxy.CacheConfig) *Server {
 	routes := append([]config.RouteConfig(nil), cfg.Routes...)
 	sort.Slice(routes, func(i, j int) bool {
 		return len(routes[i].PathPrefix) > len(routes[j].PathPrefix)
@@ -43,16 +45,28 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 	if provider == nil {
 		provider = intel.NoopProvider{}
 	}
+	metrics := cachemetrics.New()
+	cacheConfig := proxy.CacheConfig{}
+	if len(cacheConfigs) > 0 {
+		cacheConfig = cacheConfigs[0]
+	}
+	cacheConfig.Metrics = metrics
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	bearer, bearerOK := secretFromEnv(cfg.Auth.BearerTokenEnv)
 	basicUser, basicUserOK := secretFromEnv(cfg.Auth.BasicUsernameEnv)
 	basicPass, basicPassOK := secretFromEnv(cfg.Auth.BasicPasswordEnv)
 	return &Server{
-		cfg:       cfg,
-		policy:    policyEngine,
-		intel:     provider,
-		proxy:     proxy.New(cfg.Server.PublicBaseURL),
+		cfg:    cfg,
+		policy: policyEngine,
+		intel:  provider,
+		proxy: proxy.New(
+			cfg.Server.PublicBaseURL,
+			proxy.WithCache(cacheConfig),
+			proxy.WithLogger(logger),
+		),
+		metrics:   metrics,
 		audit:     audit.New(),
-		logger:    slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		logger:    logger,
 		routes:    routes,
 		bearer:    bearer,
 		basicUser: basicUser,
@@ -78,6 +92,7 @@ func (s *Server) routesHandler() http.Handler {
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
+	mux.Handle("/metrics", s.metrics.Handler())
 	mux.HandleFunc("/", s.handle)
 	return mux
 }
@@ -209,7 +224,6 @@ func toRegistryRoute(route config.RouteConfig) registry.Route {
 		UpstreamURL:      route.UpstreamURL,
 		FileUpstreamURL:  route.FileUpstreamURL,
 		UpstreamTokenEnv: route.UpstreamTokenEnv,
-		CacheTTLSeconds:  int64(route.CacheTTL.Std() / time.Second),
 	}
 }
 
@@ -245,8 +259,8 @@ func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-func Run(ctx context.Context, cfg config.Config, policyEngine *policy.Engine, provider intel.Provider) error {
-	srv := New(cfg, policyEngine, provider).HTTPServer()
+func Run(ctx context.Context, cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfigs ...proxy.CacheConfig) error {
+	srv := New(cfg, policyEngine, provider, cacheConfigs...).HTTPServer()
 	errCh := make(chan error, 1)
 	go func() {
 		err := srv.ListenAndServe()

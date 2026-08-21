@@ -40,6 +40,9 @@ policy:
 	if cfg.Server.WriteTimeout.Std() != 10*time.Minute {
 		t.Fatalf("write timeout = %s", cfg.Server.WriteTimeout.Std())
 	}
+	if cfg.Upstream.RequestTimeout.Std() != 9*time.Minute || cfg.Upstream.ResponseHeaderTimeout.Std() != 30*time.Second {
+		t.Fatalf("upstream timeouts = request %s response headers %s", cfg.Upstream.RequestTimeout.Std(), cfg.Upstream.ResponseHeaderTimeout.Std())
+	}
 	if cfg.Cache.ReadTimeout.Std() != 30*time.Second || cfg.Cache.StoreTimeout.Std() != 10*time.Minute {
 		t.Fatalf("cache timeouts = read %s store %s", cfg.Cache.ReadTimeout.Std(), cfg.Cache.StoreTimeout.Std())
 	}
@@ -53,6 +56,93 @@ func TestValidateRejectsZeroWriteTimeout(t *testing.T) {
 	cfg.Server.WriteTimeout = 0
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected zero write timeout to be rejected")
+	}
+}
+
+func TestValidateUpstreamTimeouts(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		want      string
+	}{
+		{name: "request timeout required", configure: func(cfg *Config) {
+			cfg.Upstream.RequestTimeout = 0
+		}, want: "upstream.request_timeout must be positive"},
+		{name: "request timeout leaves response window", configure: func(cfg *Config) {
+			cfg.Upstream.RequestTimeout = cfg.Server.WriteTimeout
+		}, want: "server.write_timeout must exceed the combined active"},
+		{name: "request timeout leaves intelligence window", configure: func(cfg *Config) {
+			cfg.Upstream.RequestTimeout = Duration(9*time.Minute + 55*time.Second)
+		}, want: "server.write_timeout must exceed the combined active"},
+		{name: "request timeout leaves cache read window", configure: func(cfg *Config) {
+			cfg.Intel.OSV.Enabled = false
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/cache"
+			cfg.Cache.ReadTimeout = Duration(2 * time.Minute)
+		}, want: "server.write_timeout must exceed the combined active"},
+		{name: "response header timeout required", configure: func(cfg *Config) {
+			cfg.Upstream.ResponseHeaderTimeout = 0
+		}, want: "upstream.response_header_timeout must be positive"},
+		{name: "response header timeout bounded by request", configure: func(cfg *Config) {
+			cfg.Upstream.RequestTimeout = Duration(time.Minute)
+			cfg.Upstream.ResponseHeaderTimeout = Duration(2 * time.Minute)
+		}, want: "upstream.response_header_timeout cannot exceed upstream.request_timeout"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			test.configure(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateTimeoutBudgetIncludesOnlyEnabledWork(t *testing.T) {
+	cfg := Default()
+	cfg.Intel.OSV.Enabled = false
+	cfg.Upstream.RequestTimeout = Duration(9*time.Minute + 59*time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNormalizeHTTPOrigin(t *testing.T) {
+	tests := []struct {
+		value string
+		want  string
+	}{
+		{value: "https://CDN.example", want: "https://cdn.example:443"},
+		{value: "http://registry.example:8080/", want: "http://registry.example:8080"},
+		{value: "https://[2001:db8::1]", want: "https://[2001:db8::1]:443"},
+	}
+	for _, test := range tests {
+		got, err := NormalizeHTTPOrigin(test.value)
+		if err != nil {
+			t.Fatalf("NormalizeHTTPOrigin(%q): %v", test.value, err)
+		}
+		if got != test.want {
+			t.Fatalf("NormalizeHTTPOrigin(%q) = %q want %q", test.value, got, test.want)
+		}
+	}
+	for _, value := range []string{"cdn.example", "ftp://cdn.example", "https://user@cdn.example", "https://cdn.example/files", "https://cdn.example?token=value"} {
+		if _, err := NormalizeHTTPOrigin(value); err == nil {
+			t.Fatalf("NormalizeHTTPOrigin(%q) succeeded", value)
+		}
+	}
+}
+
+func TestValidateAllowedRedirectOrigins(t *testing.T) {
+	cfg := Default()
+	cfg.Routes[0].AllowedRedirectOrigins = []string{"https://cdn.example"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Routes[0].AllowedRedirectOrigins = []string{"https://cdn.example/files"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "allowed_redirect_origins") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -195,6 +285,29 @@ func TestLoadAppliesCacheEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.Cache.ReadTimeout.Std() != 45*time.Second || cfg.Cache.StoreTimeout.Std() != 5*time.Minute {
 		t.Fatalf("cache timeouts = %#v", cfg.Cache)
+	}
+}
+
+func TestLoadAppliesUpstreamEnvironmentOverrides(t *testing.T) {
+	t.Setenv("PFW_UPSTREAM_REQUEST_TIMEOUT", "8m")
+	t.Setenv("PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT", "20s")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Upstream.RequestTimeout.Std() != 8*time.Minute || cfg.Upstream.ResponseHeaderTimeout.Std() != 20*time.Second {
+		t.Fatalf("upstream config = %#v", cfg.Upstream)
+	}
+}
+
+func TestLoadRejectsInvalidUpstreamEnvironmentValues(t *testing.T) {
+	for _, name := range []string{"PFW_UPSTREAM_REQUEST_TIMEOUT", "PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, "not-a-duration")
+			if _, err := Load(""); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }
 

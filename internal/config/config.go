@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ const maxS3PutObjectSize = int64(5_000_000_000)
 
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
+	Upstream UpstreamConfig `yaml:"upstream"`
 	Auth     AuthConfig     `yaml:"auth"`
 	Cache    CacheConfig    `yaml:"cache"`
 	Decision DecisionConfig `yaml:"decision"`
@@ -31,6 +33,11 @@ type ServerConfig struct {
 	WriteTimeout    Duration `yaml:"write_timeout"`
 	ShutdownTimeout Duration `yaml:"shutdown_timeout"`
 	PublicBaseURL   string   `yaml:"public_base_url"`
+}
+
+type UpstreamConfig struct {
+	RequestTimeout        Duration `yaml:"request_timeout"`
+	ResponseHeaderTimeout Duration `yaml:"response_header_timeout"`
 }
 
 type AuthConfig struct {
@@ -83,12 +90,14 @@ type PolicyConfig struct {
 }
 
 type RouteConfig struct {
-	Name             string `yaml:"name"`
-	Ecosystem        string `yaml:"ecosystem"`
-	PathPrefix       string `yaml:"path_prefix"`
-	UpstreamURL      string `yaml:"upstream_url"`
-	FileUpstreamURL  string `yaml:"file_upstream_url"`
-	UpstreamTokenEnv string `yaml:"upstream_token_env"`
+	Name                   string   `yaml:"name"`
+	Ecosystem              string   `yaml:"ecosystem"`
+	PathPrefix             string   `yaml:"path_prefix"`
+	UpstreamURL            string   `yaml:"upstream_url"`
+	FileUpstreamURL        string   `yaml:"file_upstream_url"`
+	UpstreamTokenEnv       string   `yaml:"upstream_token_env"`
+	EnforceRedirectOrigins bool     `yaml:"enforce_redirect_origins"`
+	AllowedRedirectOrigins []string `yaml:"allowed_redirect_origins"`
 }
 
 func Default() Config {
@@ -99,6 +108,10 @@ func Default() Config {
 			WriteTimeout:    Duration(10 * time.Minute),
 			ShutdownTimeout: Duration(10 * time.Second),
 			PublicBaseURL:   "http://localhost:8080",
+		},
+		Upstream: UpstreamConfig{
+			RequestTimeout:        Duration(9 * time.Minute),
+			ResponseHeaderTimeout: Duration(30 * time.Second),
 		},
 		Cache: CacheConfig{
 			Backend:       "none",
@@ -164,6 +177,20 @@ func applyEnv(cfg *Config) error {
 	}
 	if v := os.Getenv("PFW_PUBLIC_BASE_URL"); v != "" {
 		cfg.Server.PublicBaseURL = v
+	}
+	if v := os.Getenv("PFW_UPSTREAM_REQUEST_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_UPSTREAM_REQUEST_TIMEOUT is invalid: %w", err)
+		}
+		cfg.Upstream.RequestTimeout = Duration(parsed)
+	}
+	if v := os.Getenv("PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT is invalid: %w", err)
+		}
+		cfg.Upstream.ResponseHeaderTimeout = Duration(parsed)
 	}
 	if v := os.Getenv("PFW_FAIL_OPEN_INTEL_ERRORS"); v != "" {
 		cfg.Decision.FailOpenIntelErrors = parseBool(v, cfg.Decision.FailOpenIntelErrors)
@@ -242,6 +269,14 @@ func (cfg Config) Validate() error {
 	if cfg.Server.WriteTimeout <= 0 {
 		errs = append(errs, errors.New("server.write_timeout must be positive"))
 	}
+	if cfg.Upstream.RequestTimeout <= 0 {
+		errs = append(errs, errors.New("upstream.request_timeout must be positive"))
+	}
+	if cfg.Upstream.ResponseHeaderTimeout <= 0 {
+		errs = append(errs, errors.New("upstream.response_header_timeout must be positive"))
+	} else if cfg.Upstream.RequestTimeout > 0 && cfg.Upstream.ResponseHeaderTimeout > cfg.Upstream.RequestTimeout {
+		errs = append(errs, errors.New("upstream.response_header_timeout cannot exceed upstream.request_timeout"))
+	}
 	if _, err := url.ParseRequestURI(cfg.Server.PublicBaseURL); err != nil {
 		errs = append(errs, fmt.Errorf("server.public_base_url is invalid: %w", err))
 	}
@@ -296,6 +331,19 @@ func (cfg Config) Validate() error {
 			errs = append(errs, errors.New("intel.osv.cache_ttl must be positive"))
 		}
 	}
+	requestBudget := []time.Duration{cfg.Upstream.RequestTimeout.Std()}
+	requestBudgetValid := cfg.Server.WriteTimeout > 0 && cfg.Upstream.RequestTimeout > 0
+	if cfg.Intel.OSV.Enabled {
+		requestBudget = append(requestBudget, cfg.Intel.OSV.Timeout.Std())
+		requestBudgetValid = requestBudgetValid && cfg.Intel.OSV.Timeout > 0
+	}
+	if cfg.Cache.Backend == "filesystem" || cfg.Cache.Backend == "s3" {
+		requestBudget = append(requestBudget, cfg.Cache.ReadTimeout.Std())
+		requestBudgetValid = requestBudgetValid && cfg.Cache.ReadTimeout > 0
+	}
+	if requestBudgetValid && !durationBudgetFits(cfg.Server.WriteTimeout.Std(), requestBudget...) {
+		errs = append(errs, errors.New("server.write_timeout must exceed the combined active intelligence, cache read, and upstream request timeout budget"))
+	}
 	if len(cfg.Routes) == 0 {
 		errs = append(errs, errors.New("at least one route is required"))
 	}
@@ -314,6 +362,11 @@ func (cfg Config) Validate() error {
 		if _, err := url.ParseRequestURI(route.UpstreamURL); err != nil {
 			errs = append(errs, fmt.Errorf("route %q upstream_url is invalid: %w", route.Name, err))
 		}
+		for _, origin := range route.AllowedRedirectOrigins {
+			if _, err := NormalizeHTTPOrigin(origin); err != nil {
+				errs = append(errs, fmt.Errorf("route %q allowed_redirect_origins contains invalid origin %q: %w", route.Name, origin, err))
+			}
+		}
 		switch route.Ecosystem {
 		case "npm", "pypi", "maven", "go":
 		default:
@@ -321,6 +374,17 @@ func (cfg Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func durationBudgetFits(total time.Duration, parts ...time.Duration) bool {
+	remaining := total
+	for _, part := range parts {
+		if part <= 0 || part >= remaining {
+			return false
+		}
+		remaining -= part
+	}
+	return true
 }
 
 func validateEnabledCache(cfg CacheConfig) []error {
@@ -350,4 +414,38 @@ func validAWSAccountID(value string) bool {
 		}
 	}
 	return true
+}
+
+// NormalizeHTTPOrigin validates an HTTP(S) origin and returns a canonical
+// scheme, host, and port suitable for exact redirect-boundary comparisons.
+func NormalizeHTTPOrigin(value string) (string, error) {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(value))
+	if err != nil {
+		return "", err
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("origin scheme must be http or https")
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return "", errors.New("origin host is required")
+	}
+	if parsed.User != nil {
+		return "", errors.New("origin must not include user information")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", errors.New("origin must not include a path")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", errors.New("origin must not include a query or fragment")
+	}
+	port := parsed.Port()
+	if port == "" {
+		if scheme == "http" {
+			port = "80"
+		} else {
+			port = "443"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(parsed.Hostname()), port), nil
 }

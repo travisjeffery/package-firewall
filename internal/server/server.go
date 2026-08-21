@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -61,6 +62,10 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 		intel:  provider,
 		proxy: proxy.New(
 			cfg.Server.PublicBaseURL,
+			proxy.WithHTTPClient(proxy.NewHTTPClient(
+				cfg.Upstream.RequestTimeout.Std(),
+				cfg.Upstream.ResponseHeaderTimeout.Std(),
+			)),
 			proxy.WithCache(cacheConfig),
 			proxy.WithLogger(logger),
 		),
@@ -132,11 +137,26 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	event.UpstreamStatus = result.StatusCode
 	if err != nil {
 		event.Error = err.Error()
+		if result.StatusCode == 0 && !errors.Is(err, context.Canceled) {
+			status, code, message := upstreamErrorResponse(err)
+			event.UpstreamStatus = status
+			clear(w.Header())
+			w.Header().Set("X-Request-ID", requestID)
+			writeJSON(w, status, errorBody(code, message, requestID))
+		}
 		s.audit.Log(event)
 		s.logger.Error("proxy_failed", "request_id", requestID, "error", err)
 		return
 	}
 	s.audit.Log(event)
+}
+
+func upstreamErrorResponse(err error) (int, string, string) {
+	var timeoutError net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeoutError) && timeoutError.Timeout()) {
+		return http.StatusGatewayTimeout, "upstream_timeout", "upstream request timed out"
+	}
+	return http.StatusBadGateway, "upstream_error", "upstream request failed"
 }
 
 func (s *Server) decide(ctx context.Context, info registry.RequestInfo) policy.Decision {

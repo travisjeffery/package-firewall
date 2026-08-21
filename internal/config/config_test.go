@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,5 +96,93 @@ routes:
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load succeeded with partial basic auth config")
+	}
+}
+
+func TestValidateCacheBackends(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		wantError string
+	}{
+		{name: "filesystem", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/var/cache/package-firewall"
+		}},
+		{name: "filesystem directory required", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+		}, wantError: "cache.filesystem.directory"},
+		{name: "s3", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "s3"
+			cfg.Cache.S3.Bucket = "artifact-cache"
+			cfg.Cache.S3.ExpectedBucketOwner = "123456789012"
+		}},
+		{name: "s3 bucket required", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "s3"
+		}, wantError: "cache.s3.bucket"},
+		{name: "s3 owner validated", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "s3"
+			cfg.Cache.S3.Bucket = "artifact-cache"
+			cfg.Cache.S3.ExpectedBucketOwner = "not-an-account"
+		}, wantError: "12-digit AWS account ID"},
+		{name: "s3 single put limit", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "s3"
+			cfg.Cache.S3.Bucket = "artifact-cache"
+			cfg.Cache.MaxObjectSize = 5_000_000_001
+		}, wantError: "cannot exceed 5 GB"},
+		{name: "positive ttl", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/var/cache/package-firewall"
+			cfg.Cache.ArtifactTTL = 0
+		}, wantError: "cache.artifact_ttl"},
+		{name: "positive object size", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/var/cache/package-firewall"
+			cfg.Cache.MaxObjectSize = 0
+		}, wantError: "cache.max_object_size"},
+		{name: "unsupported", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "dynamodb"
+		}, wantError: "unsupported"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			test.configure(&cfg)
+			err := cfg.Validate()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("error = %v want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestLoadAppliesCacheEnvironmentOverrides(t *testing.T) {
+	t.Setenv("PFW_CACHE_BACKEND", "filesystem")
+	t.Setenv("PFW_CACHE_ARTIFACT_TTL", "2h")
+	t.Setenv("PFW_CACHE_MAX_OBJECT_SIZE", "4096")
+	t.Setenv("PFW_CACHE_TEMP_DIRECTORY", "/tmp/pfw-stage")
+	t.Setenv("PFW_CACHE_FILESYSTEM_DIRECTORY", "/tmp/pfw-cache")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cache.Backend != "filesystem" || cfg.Cache.ArtifactTTL.Std() != 2*time.Hour || cfg.Cache.MaxObjectSize != 4096 {
+		t.Fatalf("cache config = %#v", cfg.Cache)
+	}
+	if cfg.Cache.TempDirectory != "/tmp/pfw-stage" || cfg.Cache.Filesystem.Directory != "/tmp/pfw-cache" {
+		t.Fatalf("cache paths = %#v", cfg.Cache)
+	}
+}
+
+func TestLoadRejectsInvalidCacheEnvironmentValues(t *testing.T) {
+	t.Setenv("PFW_CACHE_ARTIFACT_TTL", "not-a-duration")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "PFW_CACHE_ARTIFACT_TTL") {
+		t.Fatalf("error = %v", err)
 	}
 }

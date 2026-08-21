@@ -10,6 +10,18 @@ auth:
   basic_username_env: ""
   basic_password_env: ""
 
+cache:
+  backend: none # none, filesystem, or s3
+  artifact_ttl: 24h
+  max_object_size: 536870912 # 512 MiB
+  temp_directory: "" # defaults to the operating system temp directory
+  filesystem:
+    directory: /var/cache/package-firewall
+  s3:
+    bucket: ""
+    prefix: package-firewall
+    expected_bucket_owner: ""
+
 decision:
   fail_open_intel_errors: true
   fail_open_unknown_package: true
@@ -32,20 +44,16 @@ routes:
     ecosystem: npm
     path_prefix: /npm/
     upstream_url: https://registry.npmjs.org/
-    cache_ttl: 10m
   - name: pypi
     ecosystem: pypi
     path_prefix: /pypi/
     upstream_url: https://pypi.org/
     file_upstream_url: https://files.pythonhosted.org/
-    cache_ttl: 10m
   - name: maven
     ecosystem: maven
     path_prefix: /maven/
     upstream_url: https://repo1.maven.org/maven2/
-    cache_ttl: 10m
   - name: go
     ecosystem: go
     path_prefix: /go/
     upstream_url: https://proxy.golang.org/
-    cache_ttl: 10m

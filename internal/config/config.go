@@ -13,9 +13,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const maxS3PutObjectSize = int64(5_000_000_000)
+
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Auth     AuthConfig     `yaml:"auth"`
+	Cache    CacheConfig    `yaml:"cache"`
 	Decision DecisionConfig `yaml:"decision"`
 	Intel    IntelConfig    `yaml:"intel"`
 	Policy   PolicyConfig   `yaml:"policy"`
@@ -34,6 +37,25 @@ type AuthConfig struct {
 	BearerTokenEnv   string `yaml:"bearer_token_env"`
 	BasicUsernameEnv string `yaml:"basic_username_env"`
 	BasicPasswordEnv string `yaml:"basic_password_env"`
+}
+
+type CacheConfig struct {
+	Backend       string                `yaml:"backend"`
+	ArtifactTTL   Duration              `yaml:"artifact_ttl"`
+	MaxObjectSize int64                 `yaml:"max_object_size"`
+	TempDirectory string                `yaml:"temp_directory"`
+	Filesystem    FilesystemCacheConfig `yaml:"filesystem"`
+	S3            S3CacheConfig         `yaml:"s3"`
+}
+
+type FilesystemCacheConfig struct {
+	Directory string `yaml:"directory"`
+}
+
+type S3CacheConfig struct {
+	Bucket              string `yaml:"bucket"`
+	Prefix              string `yaml:"prefix"`
+	ExpectedBucketOwner string `yaml:"expected_bucket_owner"`
 }
 
 type DecisionConfig struct {
@@ -59,13 +81,12 @@ type PolicyConfig struct {
 }
 
 type RouteConfig struct {
-	Name             string   `yaml:"name"`
-	Ecosystem        string   `yaml:"ecosystem"`
-	PathPrefix       string   `yaml:"path_prefix"`
-	UpstreamURL      string   `yaml:"upstream_url"`
-	FileUpstreamURL  string   `yaml:"file_upstream_url"`
-	UpstreamTokenEnv string   `yaml:"upstream_token_env"`
-	CacheTTL         Duration `yaml:"cache_ttl"`
+	Name             string `yaml:"name"`
+	Ecosystem        string `yaml:"ecosystem"`
+	PathPrefix       string `yaml:"path_prefix"`
+	UpstreamURL      string `yaml:"upstream_url"`
+	FileUpstreamURL  string `yaml:"file_upstream_url"`
+	UpstreamTokenEnv string `yaml:"upstream_token_env"`
 }
 
 func Default() Config {
@@ -76,6 +97,11 @@ func Default() Config {
 			WriteTimeout:    Duration(10 * time.Minute),
 			ShutdownTimeout: Duration(10 * time.Second),
 			PublicBaseURL:   "http://localhost:8080",
+		},
+		Cache: CacheConfig{
+			Backend:       "none",
+			ArtifactTTL:   Duration(24 * time.Hour),
+			MaxObjectSize: 512 << 20,
 		},
 		Decision: DecisionConfig{
 			FailOpenIntelErrors:         true,
@@ -92,10 +118,10 @@ func Default() Config {
 			},
 		},
 		Routes: []RouteConfig{
-			{Name: "npm", Ecosystem: "npm", PathPrefix: "/npm/", UpstreamURL: "https://registry.npmjs.org/", CacheTTL: Duration(10 * time.Minute)},
-			{Name: "pypi", Ecosystem: "pypi", PathPrefix: "/pypi/", UpstreamURL: "https://pypi.org/", FileUpstreamURL: "https://files.pythonhosted.org/", CacheTTL: Duration(10 * time.Minute)},
-			{Name: "maven", Ecosystem: "maven", PathPrefix: "/maven/", UpstreamURL: "https://repo1.maven.org/maven2/", CacheTTL: Duration(10 * time.Minute)},
-			{Name: "go", Ecosystem: "go", PathPrefix: "/go/", UpstreamURL: "https://proxy.golang.org/", CacheTTL: Duration(10 * time.Minute)},
+			{Name: "npm", Ecosystem: "npm", PathPrefix: "/npm/", UpstreamURL: "https://registry.npmjs.org/"},
+			{Name: "pypi", Ecosystem: "pypi", PathPrefix: "/pypi/", UpstreamURL: "https://pypi.org/", FileUpstreamURL: "https://files.pythonhosted.org/"},
+			{Name: "maven", Ecosystem: "maven", PathPrefix: "/maven/", UpstreamURL: "https://repo1.maven.org/maven2/"},
+			{Name: "go", Ecosystem: "go", PathPrefix: "/go/", UpstreamURL: "https://proxy.golang.org/"},
 		},
 	}
 }
@@ -119,14 +145,16 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
 }
 
-func applyEnv(cfg *Config) {
+func applyEnv(cfg *Config) error {
 	if v := os.Getenv("PFW_LISTEN_ADDR"); v != "" {
 		cfg.Server.ListenAddr = v
 	}
@@ -145,6 +173,39 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("PFW_OSV_API_URL"); v != "" {
 		cfg.Intel.OSV.APIURL = v
 	}
+	if v := os.Getenv("PFW_CACHE_BACKEND"); v != "" {
+		cfg.Cache.Backend = v
+	}
+	if v := os.Getenv("PFW_CACHE_ARTIFACT_TTL"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_CACHE_ARTIFACT_TTL is invalid: %w", err)
+		}
+		cfg.Cache.ArtifactTTL = Duration(parsed)
+	}
+	if v := os.Getenv("PFW_CACHE_MAX_OBJECT_SIZE"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("PFW_CACHE_MAX_OBJECT_SIZE is invalid: %w", err)
+		}
+		cfg.Cache.MaxObjectSize = parsed
+	}
+	if v := os.Getenv("PFW_CACHE_TEMP_DIRECTORY"); v != "" {
+		cfg.Cache.TempDirectory = v
+	}
+	if v := os.Getenv("PFW_CACHE_FILESYSTEM_DIRECTORY"); v != "" {
+		cfg.Cache.Filesystem.Directory = v
+	}
+	if v := os.Getenv("PFW_CACHE_S3_BUCKET"); v != "" {
+		cfg.Cache.S3.Bucket = v
+	}
+	if v := os.Getenv("PFW_CACHE_S3_PREFIX"); v != "" {
+		cfg.Cache.S3.Prefix = v
+	}
+	if v := os.Getenv("PFW_CACHE_S3_EXPECTED_BUCKET_OWNER"); v != "" {
+		cfg.Cache.S3.ExpectedBucketOwner = v
+	}
+	return nil
 }
 
 func parseBool(value string, fallback bool) bool {
@@ -165,6 +226,27 @@ func (cfg Config) Validate() error {
 	}
 	if _, err := url.ParseRequestURI(cfg.Server.PublicBaseURL); err != nil {
 		errs = append(errs, fmt.Errorf("server.public_base_url is invalid: %w", err))
+	}
+	switch cfg.Cache.Backend {
+	case "", "none":
+	case "filesystem":
+		errs = append(errs, validateEnabledCache(cfg.Cache)...)
+		if strings.TrimSpace(cfg.Cache.Filesystem.Directory) == "" {
+			errs = append(errs, errors.New("cache.filesystem.directory is required when cache.backend=filesystem"))
+		}
+	case "s3":
+		errs = append(errs, validateEnabledCache(cfg.Cache)...)
+		if strings.TrimSpace(cfg.Cache.S3.Bucket) == "" {
+			errs = append(errs, errors.New("cache.s3.bucket is required when cache.backend=s3"))
+		}
+		if cfg.Cache.MaxObjectSize > maxS3PutObjectSize {
+			errs = append(errs, errors.New("cache.max_object_size cannot exceed 5 GB when cache.backend=s3"))
+		}
+		if owner := cfg.Cache.S3.ExpectedBucketOwner; owner != "" && !validAWSAccountID(owner) {
+			errs = append(errs, errors.New("cache.s3.expected_bucket_owner must be a 12-digit AWS account ID"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("cache.backend %q is unsupported", cfg.Cache.Backend))
 	}
 	if cfg.Decision.DefaultVulnerabilityAction != "warn" && cfg.Decision.DefaultVulnerabilityAction != "block" && cfg.Decision.DefaultVulnerabilityAction != "monitor" {
 		errs = append(errs, errors.New("decision.default_vulnerability_action must be warn, block, or monitor"))
@@ -221,4 +303,27 @@ func (cfg Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func validateEnabledCache(cfg CacheConfig) []error {
+	var errs []error
+	if cfg.ArtifactTTL <= 0 {
+		errs = append(errs, errors.New("cache.artifact_ttl must be positive"))
+	}
+	if cfg.MaxObjectSize <= 0 {
+		errs = append(errs, errors.New("cache.max_object_size must be positive"))
+	}
+	return errs
+}
+
+func validAWSAccountID(value string) bool {
+	if len(value) != 12 {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }

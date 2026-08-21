@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,9 +10,11 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +23,11 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/registry"
 )
 
-const cacheHeader = "X-Package-Firewall-Cache"
+const (
+	cacheHeader              = "X-Package-Firewall-Cache"
+	defaultCacheReadTimeout  = 30 * time.Second
+	defaultCacheStoreTimeout = 10 * time.Minute
+)
 
 var errObjectTooLarge = errors.New("artifact exceeds cache object limit")
 
@@ -37,6 +44,8 @@ type CacheConfig struct {
 	ArtifactTTL   time.Duration
 	MaxObjectSize int64
 	TempDirectory string
+	ReadTimeout   time.Duration
+	StoreTimeout  time.Duration
 	Metrics       CacheMetrics
 }
 
@@ -47,6 +56,12 @@ func WithCache(cfg CacheConfig) Option {
 		proxy.cache = cfg
 		if proxy.cache.Metrics == nil {
 			proxy.cache.Metrics = noopCacheMetrics{}
+		}
+		if proxy.cache.ReadTimeout <= 0 {
+			proxy.cache.ReadTimeout = defaultCacheReadTimeout
+		}
+		if proxy.cache.StoreTimeout <= 0 {
+			proxy.cache.StoreTimeout = defaultCacheStoreTimeout
 		}
 	}
 }
@@ -74,6 +89,7 @@ type Proxy struct {
 	logger     *slog.Logger
 	createTemp func(string, string) (*os.File, error)
 	now        func() time.Time
+	startStore func(func())
 }
 
 func New(baseURL string, options ...Option) *Proxy {
@@ -83,6 +99,7 @@ func New(baseURL string, options ...Option) *Proxy {
 		logger:     slog.Default(),
 		createTemp: createCacheTemp,
 		now:        time.Now,
+		startStore: func(store func()) { go store() },
 		cache: CacheConfig{
 			Metrics: noopCacheMetrics{},
 		},
@@ -113,7 +130,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 		case cacheErr == nil:
 			defer cached.Close()
 			p.cache.Metrics.Hit(route.Name)
-			return serveCached(w, cached)
+			return serveCached(w, cached, p.now())
 		case errors.Is(cacheErr, artifactcache.ErrNotFound):
 			p.cache.Metrics.Miss(route.Name)
 		default:
@@ -162,7 +179,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 	}
 	if bypassReason == "" {
 		if responseReason := p.responseBypassReason(resp, target); responseReason == "" {
-			return p.serveAndStore(w, r, route, resp, cacheKey)
+			return p.serveAndStore(w, route, resp, cacheKey)
 		} else {
 			p.cache.Metrics.Bypass(route.Name, responseReason)
 		}
@@ -235,7 +252,9 @@ func (p *Proxy) responseBypassReason(resp *http.Response, target string) string 
 }
 
 func (p *Proxy) loadCached(r *http.Request, key string) (*stagedEntry, error) {
-	entry, err := p.cache.Store.Get(r.Context(), key)
+	ctx, cancel := context.WithTimeout(r.Context(), p.cache.ReadTimeout)
+	defer cancel()
+	entry, err := p.cache.Store.Get(ctx, key)
 	if err != nil {
 		if entry.Body != nil {
 			_ = entry.Body.Close()
@@ -260,10 +279,11 @@ func (p *Proxy) loadCached(r *http.Request, key string) (*stagedEntry, error) {
 		return nil, err
 	}
 	staged := &stagedEntry{
-		file:    temporary,
-		path:    temporary.Name(),
-		headers: artifactcache.SafeHeaders(entry.Headers),
-		size:    entry.Size,
+		file:     temporary,
+		path:     temporary.Name(),
+		headers:  artifactcache.SafeHeaders(entry.Headers),
+		size:     entry.Size,
+		storedAt: entry.StoredAt,
 	}
 	cleanup := true
 	defer func() {
@@ -272,7 +292,7 @@ func (p *Proxy) loadCached(r *http.Request, key string) (*stagedEntry, error) {
 		}
 	}()
 
-	written, checksum, copyErr := copyBounded(temporary, entry.Body, p.cache.MaxObjectSize)
+	written, checksum, copyErr := copyBounded(ctx, temporary, entry.Body, p.cache.MaxObjectSize)
 	closeErr := entry.Body.Close()
 	if copyErr != nil || closeErr != nil {
 		return nil, errors.Join(copyErr, closeErr)
@@ -290,8 +310,8 @@ func (p *Proxy) loadCached(r *http.Request, key string) (*stagedEntry, error) {
 	return staged, nil
 }
 
-func serveCached(w http.ResponseWriter, cached *stagedEntry) (Result, error) {
-	copyResponseHeaders(w.Header(), cached.headers)
+func serveCached(w http.ResponseWriter, cached *stagedEntry, now time.Time) (Result, error) {
+	copyResponseHeaders(w.Header(), agedHeaders(cached.headers, cached.storedAt, now))
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", cached.size))
 	w.Header().Set(cacheHeader, "HIT")
 	w.WriteHeader(http.StatusOK)
@@ -302,7 +322,30 @@ func serveCached(w http.ResponseWriter, cached *stagedEntry) (Result, error) {
 	return Result{StatusCode: http.StatusOK}, err
 }
 
-func (p *Proxy) serveAndStore(w http.ResponseWriter, r *http.Request, route config.RouteConfig, resp *http.Response, key string) (Result, error) {
+func agedHeaders(headers http.Header, storedAt, now time.Time) http.Header {
+	aged := artifactcache.SafeHeaders(headers)
+	var age int64
+	if value, err := strconv.ParseInt(strings.TrimSpace(aged.Get("Age")), 10, 64); err == nil && value > 0 {
+		age = value
+	}
+	if date, err := http.ParseTime(aged.Get("Date")); err == nil && storedAt.After(date) {
+		if apparent := int64(storedAt.Sub(date) / time.Second); apparent > age {
+			age = apparent
+		}
+	}
+	if now.After(storedAt) {
+		resident := int64(now.Sub(storedAt) / time.Second)
+		if age > math.MaxInt64-resident {
+			age = math.MaxInt64
+		} else {
+			age += resident
+		}
+	}
+	aged.Set("Age", strconv.FormatInt(age, 10))
+	return aged
+}
+
+func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, resp *http.Response, key string) (Result, error) {
 	temporary, err := p.createTemp(p.cache.TempDirectory, "package-firewall-cache-miss-*")
 	if err != nil {
 		p.recordStoreError(route.Name, err)
@@ -310,9 +353,12 @@ func (p *Proxy) serveAndStore(w http.ResponseWriter, r *http.Request, route conf
 		_, copyErr := io.Copy(w, resp.Body)
 		return Result{StatusCode: resp.StatusCode}, copyErr
 	}
+	cleanup := true
 	defer func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporary.Name())
+		if cleanup {
+			_ = temporary.Close()
+			_ = os.Remove(temporary.Name())
+		}
 	}()
 
 	spool := newCaptureSpool(temporary, p.cache.MaxObjectSize)
@@ -332,15 +378,32 @@ func (p *Proxy) serveAndStore(w http.ResponseWriter, r *http.Request, route conf
 		p.recordStoreError(route.Name, err)
 		return Result{StatusCode: resp.StatusCode}, nil
 	}
-	if err := p.cache.Store.Put(r.Context(), key, artifactcache.PutRequest{
-		Headers:   artifactcache.SafeHeaders(resp.Header),
+	storedAt := p.now()
+	headers := artifactcache.SafeHeaders(resp.Header)
+	if headers.Get("Date") == "" {
+		headers.Set("Date", storedAt.UTC().Format(http.TimeFormat))
+	}
+	request := artifactcache.PutRequest{
+		Headers:   headers,
 		Body:      temporary,
 		SHA256:    spool.checksum(),
 		Size:      spool.size,
-		ExpiresAt: p.now().Add(p.cache.ArtifactTTL),
-	}); err != nil {
-		p.recordStoreError(route.Name, err)
+		StoredAt:  storedAt,
+		ExpiresAt: storedAt.Add(p.cache.ArtifactTTL),
 	}
+	temporaryPath := temporary.Name()
+	cleanup = false
+	p.startStore(func() {
+		defer func() {
+			_ = temporary.Close()
+			_ = os.Remove(temporaryPath)
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), p.cache.StoreTimeout)
+		defer cancel()
+		if err := p.cache.Store.Put(ctx, key, request); err != nil {
+			p.recordStoreError(route.Name, err)
+		}
+	})
 	return Result{StatusCode: resp.StatusCode}, nil
 }
 
@@ -349,13 +412,19 @@ func (p *Proxy) recordStoreError(route string, err error) {
 	p.logger.Warn("artifact_cache_store_failed", "route", route, "error", err)
 }
 
-func copyBounded(dst io.Writer, src io.Reader, maximum int64) (int64, string, error) {
+func copyBounded(ctx context.Context, dst io.Writer, src io.Reader, maximum int64) (int64, string, error) {
 	hasher := sha256.New()
 	writer := io.MultiWriter(dst, hasher)
 	buffer := make([]byte, 32<<10)
 	var written int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return written, hex.EncodeToString(hasher.Sum(nil)), err
+		}
 		read, readErr := src.Read(buffer)
+		if err := ctx.Err(); err != nil {
+			return written, hex.EncodeToString(hasher.Sum(nil)), err
+		}
 		if read > 0 {
 			allowed := int64(read)
 			if remaining := maximum - written; allowed > remaining {
@@ -461,10 +530,11 @@ func streamAndCapture(dst io.Writer, src io.Reader, spool *captureSpool) error {
 }
 
 type stagedEntry struct {
-	file    *os.File
-	path    string
-	headers http.Header
-	size    int64
+	file     *os.File
+	path     string
+	headers  http.Header
+	size     int64
+	storedAt time.Time
 }
 
 func createCacheTemp(directory, pattern string) (*os.File, error) {
@@ -561,8 +631,12 @@ func withRequestQuery(target string, requestURL *url.URL) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	parsed.RawQuery = requestURL.RawQuery
-	parsed.ForceQuery = requestURL.ForceQuery
+	if parsed.RawQuery == "" {
+		parsed.RawQuery = requestURL.RawQuery
+	} else if requestURL.RawQuery != "" {
+		parsed.RawQuery += "&" + requestURL.RawQuery
+	}
+	parsed.ForceQuery = parsed.ForceQuery || requestURL.ForceQuery
 	return parsed.String(), nil
 }
 

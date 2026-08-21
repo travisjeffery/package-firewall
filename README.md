@@ -124,6 +124,8 @@ Important settings:
 - `cache.artifact_ttl`: freshness lifetime stored with each cached artifact.
 - `cache.max_object_size`: maximum artifact bytes ever written to temporary cache storage.
 - `cache.temp_directory`: staging directory for bounded fills and integrity-checked hits; the operating system temp directory is used when empty.
+- `cache.read_timeout`: maximum time spent loading and integrity-checking a cache hit before falling back to upstream.
+- `cache.store_timeout`: maximum lifetime of a background cache store after the client response completes.
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
@@ -131,7 +133,8 @@ Important settings:
 
 Cache settings can also be supplied with `PFW_CACHE_BACKEND`,
 `PFW_CACHE_ARTIFACT_TTL`, `PFW_CACHE_MAX_OBJECT_SIZE`,
-`PFW_CACHE_TEMP_DIRECTORY`, `PFW_CACHE_FILESYSTEM_DIRECTORY`,
+`PFW_CACHE_TEMP_DIRECTORY`, `PFW_CACHE_READ_TIMEOUT`,
+`PFW_CACHE_STORE_TIMEOUT`, `PFW_CACHE_FILESYSTEM_DIRECTORY`,
 `PFW_CACHE_S3_BUCKET`, `PFW_CACHE_S3_PREFIX`, and
 `PFW_CACHE_S3_EXPECTED_BUCKET_OWNER`.
 
@@ -142,8 +145,9 @@ The artifact cache is deliberately narrower than a general HTTP cache:
 - Authentication, package identification, local policy, and OSV-based decisions run before every cache lookup. A newly blocked package cannot be served from an old cache entry.
 - Only exact package artifacts identified with a concrete name, version, and PURL are eligible. Requests must be bodyless `GET`s with no query, `Range`, conditional headers, cache-revalidation directives, cookies, or representation-selecting headers.
 - Only upstream status `200` responses are stored. Redirected, ranged, encoded, `Vary`, `Set-Cookie`, `private`, `no-cache`, and `no-store` responses bypass storage.
-- A miss streams the complete upstream response to the client independently of a bounded temp-file capture. The capture stops at `cache.max_object_size`; temp-file and backend write errors do not interrupt or alter the client response.
+- A miss streams the complete upstream response to the client independently of a bounded temp-file capture. The capture stops at `cache.max_object_size`; bounded backend stores continue in the background and cannot delay response completion.
 - A hit is downloaded to bounded temp storage and checked against its recorded byte count and SHA-256 before response headers or body bytes are sent. A missing, truncated, corrupt, or unreadable entry becomes an ordinary miss.
+- Cache reads are bounded by `cache.read_timeout`; a slow cache becomes a clean miss instead of delaying the upstream fallback indefinitely.
 
 Responses include `X-Package-Firewall-Cache: HIT`, `MISS`, or `BYPASS`.
 The `/metrics` endpoint exports:
@@ -170,6 +174,8 @@ cache:
   artifact_ttl: 24h
   max_object_size: 536870912
   temp_directory: /var/cache/package-firewall-stage
+  read_timeout: 30s
+  store_timeout: 10m
   s3:
     bucket: company-package-firewall-cache
     prefix: artifacts
@@ -240,6 +246,8 @@ cache:
   backend: filesystem
   artifact_ttl: 24h
   max_object_size: 536870912
+  read_timeout: 30s
+  store_timeout: 10m
   filesystem:
     directory: /var/cache/package-firewall
 ```

@@ -28,6 +28,7 @@ func TestFileSystemStoreRoundTripAndExpiry(t *testing.T) {
 		Body:      bytes.NewReader(body),
 		SHA256:    digestBytes(body),
 		Size:      int64(len(body)),
+		StoredAt:  now,
 		ExpiresAt: now.Add(time.Hour),
 	}); err != nil {
 		t.Fatal(err)
@@ -45,6 +46,9 @@ func TestFileSystemStoreRoundTripAndExpiry(t *testing.T) {
 	}
 	if !bytes.Equal(readBody, body) || entry.Size != int64(len(body)) || entry.SHA256 != digestBytes(body) {
 		t.Fatalf("entry = size %d sha %q body %q", entry.Size, entry.SHA256, readBody)
+	}
+	if !entry.StoredAt.Equal(now) {
+		t.Fatalf("stored at = %s want %s", entry.StoredAt, now)
 	}
 	if entry.Headers.Get("Content-Type") != "application/octet-stream" || entry.Headers.Get("ETag") != `"artifact-v1"` {
 		t.Fatalf("headers = %#v", entry.Headers)
@@ -68,6 +72,7 @@ func TestFileSystemStoreDoesNotReplaceGoodEntryWithPartialPut(t *testing.T) {
 		Body:      bytes.NewReader(oldBody),
 		SHA256:    digestBytes(oldBody),
 		Size:      int64(len(oldBody)),
+		StoredAt:  expiresAt.Add(-time.Hour),
 		ExpiresAt: expiresAt,
 	}); err != nil {
 		t.Fatal(err)
@@ -76,6 +81,7 @@ func TestFileSystemStoreDoesNotReplaceGoodEntryWithPartialPut(t *testing.T) {
 		Body:      strings.NewReader("short"),
 		SHA256:    digestBytes([]byte("expected-body")),
 		Size:      int64(len("expected-body")),
+		StoredAt:  expiresAt.Add(-time.Hour),
 		ExpiresAt: expiresAt,
 	}); err == nil {
 		t.Fatal("partial put succeeded")

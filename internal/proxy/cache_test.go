@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -63,6 +64,182 @@ func TestProxyCachesIntegrityCheckedArtifact(t *testing.T) {
 	}
 	if metrics.hits["npm"] != 1 || metrics.misses["npm"] != 1 {
 		t.Fatalf("metrics: hits = %v misses = %v", metrics.hits, metrics.misses)
+	}
+}
+
+func TestProxyPreservesFreshnessAgeOnCacheHits(t *testing.T) {
+	storedAt := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	current := storedAt
+	originDate := storedAt.Add(-30 * time.Second).Format(http.TimeFormat)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Age", "100")
+		w.Header().Set("Cache-Control", "public, max-age=120")
+		w.Header().Set("Date", originDate)
+		_, _ = io.WriteString(w, "artifact-body")
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	proxy := newTestCachingProxy(t, store, newTestCacheMetrics(), 1024)
+	proxy.now = func() time.Time { return current }
+	route := testNPMRoute(upstream.URL)
+	for _, wantStatus := range []string{"MISS", "HIT"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		if got := recorder.Header().Get(cacheHeader); got != wantStatus {
+			t.Fatalf("cache status = %q want %q", got, wantStatus)
+		}
+		if wantStatus == "MISS" {
+			current = storedAt.Add(45 * time.Second)
+			continue
+		}
+		if got := recorder.Header().Get("Date"); got != originDate {
+			t.Fatalf("cached Date = %q want %q", got, originDate)
+		}
+		if got := recorder.Header().Get("Age"); got != "145" {
+			t.Fatalf("cached Age = %q want 145", got)
+		}
+	}
+}
+
+func TestWithRequestQueryPreservesConfiguredParameters(t *testing.T) {
+	requestURL, err := url.Parse("http://firewall.test/artifact?download=1&scope=client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := withRequestQuery("https://registry.test/artifact?api-version=1&scope=route", requestURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := parsed.Query()
+	if values.Get("api-version") != "1" || values.Get("download") != "1" {
+		t.Fatalf("merged query = %v", values)
+	}
+	if scopes := values["scope"]; len(scopes) != 2 || scopes[0] != "route" || scopes[1] != "client" {
+		t.Fatalf("merged scope values = %v", scopes)
+	}
+}
+
+func TestProxyTimesOutCacheReadsAndFallsBackToUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "complete-upstream-body")
+	}))
+	defer upstream.Close()
+	store := &stubArtifactStore{
+		get: func(ctx context.Context, _ string) (artifactcache.Entry, error) {
+			<-ctx.Done()
+			return artifactcache.Entry{}, ctx.Err()
+		},
+		put: func(_ context.Context, _ string, req artifactcache.PutRequest) error {
+			_, err := io.Copy(io.Discard, req.Body)
+			return err
+		},
+	}
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	proxy.cache.ReadTimeout = 20 * time.Millisecond
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+	started := time.Now()
+	if _, err := proxy.Serve(recorder, request, testNPMRoute(upstream.URL), exactArtifactInfo()); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("cache timeout fallback took %s", elapsed)
+	}
+	if recorder.Body.String() != "complete-upstream-body" || recorder.Header().Get(cacheHeader) != "MISS" {
+		t.Fatalf("response status = %d cache = %q body = %q", recorder.Code, recorder.Header().Get(cacheHeader), recorder.Body.String())
+	}
+	if metrics.readErrors["npm"] != 1 || metrics.misses["npm"] != 1 {
+		t.Fatalf("metrics: read errors = %v misses = %v", metrics.readErrors, metrics.misses)
+	}
+}
+
+func TestProxyCompletesChunkedResponseBeforeCacheStore(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = io.WriteString(w, "artifact-body")
+	}))
+	defer upstream.Close()
+	store := &blockingPutStore{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(store.release)
+		}
+	}()
+	proxy := New(
+		"http://firewall.test",
+		WithCache(CacheConfig{
+			Store:         store,
+			ArtifactTTL:   time.Hour,
+			MaxObjectSize: 1024,
+			TempDirectory: t.TempDir(),
+			ReadTimeout:   time.Second,
+			StoreTimeout:  5 * time.Second,
+		}),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = proxy.Serve(w, r, testNPMRoute(upstream.URL), exactArtifactInfo())
+	}))
+	defer downstream.Close()
+
+	type responseResult struct {
+		body []byte
+		err  error
+	}
+	responseDone := make(chan responseResult, 1)
+	go func() {
+		client := &http.Client{Timeout: 2 * time.Second}
+		request, err := http.NewRequest(http.MethodGet, downstream.URL+"/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		if err != nil {
+			responseDone <- responseResult{err: err}
+			return
+		}
+		request.Header.Set("Accept-Encoding", "identity")
+		response, err := client.Do(request)
+		if err != nil {
+			responseDone <- responseResult{err: err}
+			return
+		}
+		body, readErr := io.ReadAll(response.Body)
+		responseDone <- responseResult{body: body, err: errors.Join(readErr, response.Body.Close())}
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("cache store did not start")
+	}
+	select {
+	case result := <-responseDone:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if string(result.body) != "artifact-body" {
+			t.Fatalf("response body = %q", result.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("chunked response waited for cache store completion")
+	}
+	close(store.release)
+	released = true
+	select {
+	case <-store.finished:
+	case <-time.After(time.Second):
+		t.Fatal("cache store did not finish")
 	}
 }
 
@@ -259,6 +436,7 @@ func TestProxyTreatsCacheReadFailuresAsCleanMisses(t *testing.T) {
 				Body:      &readErrorAfterData{body: []byte(cachedBody)},
 				SHA256:    checksum(cachedBody),
 				Size:      int64(len(cachedBody)),
+				StoredAt:  time.Now(),
 				ExpiresAt: time.Now().Add(time.Hour),
 			}, nil
 		}},
@@ -267,6 +445,7 @@ func TestProxyTreatsCacheReadFailuresAsCleanMisses(t *testing.T) {
 				Body:      io.NopCloser(strings.NewReader("short")),
 				SHA256:    checksum(cachedBody),
 				Size:      int64(len(cachedBody)),
+				StoredAt:  time.Now(),
 				ExpiresAt: time.Now().Add(time.Hour),
 			}, nil
 		}},
@@ -275,6 +454,7 @@ func TestProxyTreatsCacheReadFailuresAsCleanMisses(t *testing.T) {
 				Body:      io.NopCloser(strings.NewReader(cachedBody)),
 				SHA256:    checksum("different"),
 				Size:      int64(len(cachedBody)),
+				StoredAt:  time.Now(),
 				ExpiresAt: time.Now().Add(time.Hour),
 			}, nil
 		}},
@@ -354,6 +534,7 @@ func TestProxyTempStorageFailureFallsBackWithoutPartialResponse(t *testing.T) {
 				Body:      io.NopCloser(strings.NewReader(cachedBody)),
 				SHA256:    checksum(cachedBody),
 				Size:      int64(len(cachedBody)),
+				StoredAt:  time.Now(),
 				ExpiresAt: time.Now().Add(time.Hour),
 			}, nil
 		},
@@ -440,7 +621,7 @@ func TestCaptureSpoolWriteErrorDoesNotInterruptClient(t *testing.T) {
 
 func newTestCachingProxy(t *testing.T, store artifactcache.Store, metrics CacheMetrics, limit int64) *Proxy {
 	t.Helper()
-	return New(
+	proxy := New(
 		"http://firewall.test",
 		WithCache(CacheConfig{
 			Store:         store,
@@ -451,6 +632,8 @@ func newTestCachingProxy(t *testing.T, store artifactcache.Store, metrics CacheM
 		}),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
+	proxy.startStore = func(store func()) { store() }
+	return proxy
 }
 
 func testNPMRoute(upstreamURL string) config.RouteConfig {
@@ -491,6 +674,7 @@ type storedArtifact struct {
 	headers   http.Header
 	body      []byte
 	sha256    string
+	storedAt  time.Time
 	expiresAt time.Time
 }
 
@@ -515,6 +699,7 @@ func (s *memoryArtifactStore) Get(_ context.Context, key string) (artifactcache.
 		Body:      io.NopCloser(bytes.NewReader(entry.body)),
 		SHA256:    entry.sha256,
 		Size:      int64(len(entry.body)),
+		StoredAt:  entry.storedAt,
 		ExpiresAt: entry.expiresAt,
 	}, nil
 }
@@ -529,6 +714,7 @@ func (s *memoryArtifactStore) Put(_ context.Context, key string, req artifactcac
 		headers:   artifactcache.SafeHeaders(req.Headers),
 		body:      body,
 		sha256:    req.SHA256,
+		storedAt:  req.StoredAt,
 		expiresAt: req.ExpiresAt,
 	}
 	return nil
@@ -539,6 +725,30 @@ type stubArtifactStore struct {
 	put      func(context.Context, string, artifactcache.PutRequest) error
 	getCalls int
 	putCalls int
+}
+
+type blockingPutStore struct {
+	started  chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+}
+
+func (*blockingPutStore) Get(context.Context, string) (artifactcache.Entry, error) {
+	return artifactcache.Entry{}, artifactcache.ErrNotFound
+}
+
+func (s *blockingPutStore) Put(ctx context.Context, _ string, req artifactcache.PutRequest) error {
+	defer close(s.finished)
+	if _, err := io.Copy(io.Discard, req.Body); err != nil {
+		return err
+	}
+	close(s.started)
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *stubArtifactStore) Get(ctx context.Context, key string) (artifactcache.Entry, error) {

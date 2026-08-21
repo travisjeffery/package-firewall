@@ -15,6 +15,8 @@ cache:
   artifact_ttl: 24h
   max_object_size: 536870912 # 512 MiB
   temp_directory: "" # defaults to the operating system temp directory
+  read_timeout: 30s
+  store_timeout: 10m
   filesystem:
     directory: /var/cache/package-firewall
   s3:

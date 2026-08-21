@@ -36,6 +36,7 @@ func TestS3StoreRoundTripMetadata(t *testing.T) {
 		Body:      bytes.NewReader(body),
 		SHA256:    digestBytes(body),
 		Size:      int64(len(body)),
+		StoredAt:  now,
 		ExpiresAt: now.Add(time.Hour),
 	}
 	if err := store.Put(context.Background(), key, request); err != nil {
@@ -80,6 +81,9 @@ func TestS3StoreRoundTripMetadata(t *testing.T) {
 	if !bytes.Equal(readBody, body) || entry.SHA256 != request.SHA256 || entry.Size != int64(len(body)) {
 		t.Fatalf("entry = size %d sha %q body %q", entry.Size, entry.SHA256, readBody)
 	}
+	if !entry.StoredAt.Equal(now) {
+		t.Fatalf("stored at = %s want %s", entry.StoredAt, now)
+	}
 	if entry.Headers.Get("ETag") != `"artifact-v1"` || entry.Headers.Get("Set-Cookie") != "" {
 		t.Fatalf("headers = %#v", entry.Headers)
 	}
@@ -105,6 +109,7 @@ func TestS3StoreTreatsMissingAndExpiredObjectsAsMisses(t *testing.T) {
 		Metadata: map[string]string{
 			"pfw-version":    s3MetadataVersion,
 			"pfw-sha256":     digestBytes([]byte("artifact")),
+			"pfw-stored-at":  now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
 			"pfw-expires-at": now.Add(-time.Minute).Format(time.RFC3339Nano),
 			"pfw-headers":    mustEncodeHeaders(t, http.Header{}),
 		},
@@ -127,6 +132,7 @@ func TestS3StoreRejectsOversizedHeaderMetadataBeforePut(t *testing.T) {
 		Body:      bytes.NewReader(body),
 		SHA256:    digestBytes(body),
 		Size:      int64(len(body)),
+		StoredAt:  time.Now(),
 		ExpiresAt: time.Now().Add(time.Hour),
 	})
 	if err == nil {
@@ -134,6 +140,15 @@ func TestS3StoreRejectsOversizedHeaderMetadataBeforePut(t *testing.T) {
 	}
 	if client.putInput != nil {
 		t.Fatal("PutObject was called with oversized metadata")
+	}
+}
+
+func TestS3StorePreservesConfiguredPrefixBytes(t *testing.T) {
+	key := Key("npm", "pkg", "1.0.0")
+	store := NewS3Store(S3Config{Prefix: "/nested//./artifacts/"})
+	want := "nested//./artifacts/v1/" + key[:2] + "/" + key + ".artifact"
+	if got := store.objectKey(key); got != want {
+		t.Fatalf("object key = %q want %q", got, want)
 	}
 }
 

@@ -44,6 +44,8 @@ type CacheConfig struct {
 	ArtifactTTL   Duration              `yaml:"artifact_ttl"`
 	MaxObjectSize int64                 `yaml:"max_object_size"`
 	TempDirectory string                `yaml:"temp_directory"`
+	ReadTimeout   Duration              `yaml:"read_timeout"`
+	StoreTimeout  Duration              `yaml:"store_timeout"`
 	Filesystem    FilesystemCacheConfig `yaml:"filesystem"`
 	S3            S3CacheConfig         `yaml:"s3"`
 }
@@ -102,6 +104,8 @@ func Default() Config {
 			Backend:       "none",
 			ArtifactTTL:   Duration(24 * time.Hour),
 			MaxObjectSize: 512 << 20,
+			ReadTimeout:   Duration(30 * time.Second),
+			StoreTimeout:  Duration(10 * time.Minute),
 		},
 		Decision: DecisionConfig{
 			FailOpenIntelErrors:         true,
@@ -192,6 +196,20 @@ func applyEnv(cfg *Config) error {
 	}
 	if v := os.Getenv("PFW_CACHE_TEMP_DIRECTORY"); v != "" {
 		cfg.Cache.TempDirectory = v
+	}
+	if v := os.Getenv("PFW_CACHE_READ_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_CACHE_READ_TIMEOUT is invalid: %w", err)
+		}
+		cfg.Cache.ReadTimeout = Duration(parsed)
+	}
+	if v := os.Getenv("PFW_CACHE_STORE_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_CACHE_STORE_TIMEOUT is invalid: %w", err)
+		}
+		cfg.Cache.StoreTimeout = Duration(parsed)
 	}
 	if v := os.Getenv("PFW_CACHE_FILESYSTEM_DIRECTORY"); v != "" {
 		cfg.Cache.Filesystem.Directory = v
@@ -312,6 +330,12 @@ func validateEnabledCache(cfg CacheConfig) []error {
 	}
 	if cfg.MaxObjectSize <= 0 {
 		errs = append(errs, errors.New("cache.max_object_size must be positive"))
+	}
+	if cfg.ReadTimeout <= 0 {
+		errs = append(errs, errors.New("cache.read_timeout must be positive"))
+	}
+	if cfg.StoreTimeout <= 0 {
+		errs = append(errs, errors.New("cache.store_timeout must be positive"))
 	}
 	return errs
 }

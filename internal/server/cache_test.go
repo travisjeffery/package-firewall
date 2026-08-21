@@ -143,6 +143,7 @@ func (s *repeatingHitStore) Get(context.Context, string) (artifactcache.Entry, e
 		Body:      io.NopCloser(bytes.NewReader(s.body)),
 		SHA256:    hex.EncodeToString(digest[:]),
 		Size:      int64(len(s.body)),
+		StoredAt:  time.Now(),
 		ExpiresAt: time.Now().Add(time.Hour),
 	}, nil
 }

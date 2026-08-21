@@ -79,6 +79,8 @@ func cacheFromConfig(ctx context.Context, cfg config.Config) (proxy.CacheConfig,
 		ArtifactTTL:   cfg.Cache.ArtifactTTL.Std(),
 		MaxObjectSize: cfg.Cache.MaxObjectSize,
 		TempDirectory: cfg.Cache.TempDirectory,
+		ReadTimeout:   cfg.Cache.ReadTimeout.Std(),
+		StoreTimeout:  cfg.Cache.StoreTimeout.Std(),
 	}
 	switch cfg.Cache.Backend {
 	case "", "none":

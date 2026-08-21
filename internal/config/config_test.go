@@ -40,6 +40,9 @@ policy:
 	if cfg.Server.WriteTimeout.Std() != 10*time.Minute {
 		t.Fatalf("write timeout = %s", cfg.Server.WriteTimeout.Std())
 	}
+	if cfg.Cache.ReadTimeout.Std() != 30*time.Second || cfg.Cache.StoreTimeout.Std() != 10*time.Minute {
+		t.Fatalf("cache timeouts = read %s store %s", cfg.Cache.ReadTimeout.Std(), cfg.Cache.StoreTimeout.Std())
+	}
 	if cfg.Policy.Files[0] != filepath.Join(dir, "policy.yml") {
 		t.Fatalf("policy path = %q", cfg.Policy.Files[0])
 	}
@@ -140,6 +143,16 @@ func TestValidateCacheBackends(t *testing.T) {
 			cfg.Cache.Filesystem.Directory = "/var/cache/package-firewall"
 			cfg.Cache.MaxObjectSize = 0
 		}, wantError: "cache.max_object_size"},
+		{name: "positive read timeout", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/var/cache/package-firewall"
+			cfg.Cache.ReadTimeout = 0
+		}, wantError: "cache.read_timeout"},
+		{name: "positive store timeout", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/var/cache/package-firewall"
+			cfg.Cache.StoreTimeout = 0
+		}, wantError: "cache.store_timeout"},
 		{name: "unsupported", configure: func(cfg *Config) {
 			cfg.Cache.Backend = "dynamodb"
 		}, wantError: "unsupported"},
@@ -167,6 +180,8 @@ func TestLoadAppliesCacheEnvironmentOverrides(t *testing.T) {
 	t.Setenv("PFW_CACHE_ARTIFACT_TTL", "2h")
 	t.Setenv("PFW_CACHE_MAX_OBJECT_SIZE", "4096")
 	t.Setenv("PFW_CACHE_TEMP_DIRECTORY", "/tmp/pfw-stage")
+	t.Setenv("PFW_CACHE_READ_TIMEOUT", "45s")
+	t.Setenv("PFW_CACHE_STORE_TIMEOUT", "5m")
 	t.Setenv("PFW_CACHE_FILESYSTEM_DIRECTORY", "/tmp/pfw-cache")
 	cfg, err := Load("")
 	if err != nil {
@@ -178,11 +193,18 @@ func TestLoadAppliesCacheEnvironmentOverrides(t *testing.T) {
 	if cfg.Cache.TempDirectory != "/tmp/pfw-stage" || cfg.Cache.Filesystem.Directory != "/tmp/pfw-cache" {
 		t.Fatalf("cache paths = %#v", cfg.Cache)
 	}
+	if cfg.Cache.ReadTimeout.Std() != 45*time.Second || cfg.Cache.StoreTimeout.Std() != 5*time.Minute {
+		t.Fatalf("cache timeouts = %#v", cfg.Cache)
+	}
 }
 
 func TestLoadRejectsInvalidCacheEnvironmentValues(t *testing.T) {
-	t.Setenv("PFW_CACHE_ARTIFACT_TTL", "not-a-duration")
-	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "PFW_CACHE_ARTIFACT_TTL") {
-		t.Fatalf("error = %v", err)
+	for _, name := range []string{"PFW_CACHE_ARTIFACT_TTL", "PFW_CACHE_READ_TIMEOUT", "PFW_CACHE_STORE_TIMEOUT"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, "not-a-duration")
+			if _, err := Load(""); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("error = %v", err)
+			}
+		})
 	}
 }

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	fileMagic         = "PFWART1\n"
+	fileMagic         = "PFWART2\n"
 	maxFileRecordSize = 64 << 10
 )
 
@@ -80,6 +80,7 @@ func (s *FileSystemStore) Get(ctx context.Context, key string) (Entry, error) {
 		Body:      file,
 		SHA256:    record.SHA256,
 		Size:      record.Size,
+		StoredAt:  record.StoredAt,
 		ExpiresAt: record.ExpiresAt,
 	}
 	if err := ValidateEntry(entry); err != nil {
@@ -119,6 +120,7 @@ func (s *FileSystemStore) Put(ctx context.Context, key string, req PutRequest) e
 		Headers:   SafeHeaders(req.Headers),
 		SHA256:    req.SHA256,
 		Size:      req.Size,
+		StoredAt:  req.StoredAt.UTC(),
 		ExpiresAt: req.ExpiresAt.UTC(),
 	})
 	if err != nil {
@@ -238,6 +240,7 @@ type fileRecord struct {
 	Headers   http.Header `json:"headers"`
 	SHA256    string      `json:"sha256"`
 	Size      int64       `json:"size"`
+	StoredAt  time.Time   `json:"stored_at"`
 	ExpiresAt time.Time   `json:"expires_at"`
 }
 

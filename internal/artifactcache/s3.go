@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	s3MetadataVersion       = "1"
+	s3MetadataVersion       = "2"
 	maxS3HeaderMetadataSize = 1400
 )
 
@@ -92,6 +92,10 @@ func (s *S3Store) Get(ctx context.Context, key string) (Entry, error) {
 	if output.ContentLength == nil {
 		return Entry{}, errors.Join(ErrInvalidEntry, errors.New("S3 object content length is missing"))
 	}
+	storedAt, err := time.Parse(time.RFC3339Nano, metadataValue(output.Metadata, "pfw-stored-at"))
+	if err != nil {
+		return Entry{}, errors.Join(ErrInvalidEntry, fmt.Errorf("invalid S3 stored_at metadata: %w", err))
+	}
 	headers, err := decodeS3Headers(metadataValue(output.Metadata, "pfw-headers"))
 	if err != nil {
 		return Entry{}, errors.Join(ErrInvalidEntry, err)
@@ -101,6 +105,7 @@ func (s *S3Store) Get(ctx context.Context, key string) (Entry, error) {
 		Body:      output.Body,
 		SHA256:    metadataValue(output.Metadata, "pfw-sha256"),
 		Size:      *output.ContentLength,
+		StoredAt:  storedAt,
 		ExpiresAt: expiresAt,
 	}
 	if err := ValidateEntry(entry); err != nil {
@@ -129,6 +134,7 @@ func (s *S3Store) Put(ctx context.Context, key string, req PutRequest) error {
 		Metadata: map[string]string{
 			"pfw-version":    s3MetadataVersion,
 			"pfw-sha256":     req.SHA256,
+			"pfw-stored-at":  req.StoredAt.UTC().Format(time.RFC3339Nano),
 			"pfw-expires-at": req.ExpiresAt.UTC().Format(time.RFC3339Nano),
 			"pfw-headers":    headers,
 		},
@@ -148,7 +154,7 @@ func (s *S3Store) objectKey(key string) string {
 	if s.prefix == "" {
 		return name
 	}
-	return path.Join(s.prefix, name)
+	return s.prefix + "/" + name
 }
 
 func encodeS3Headers(headers http.Header) (string, error) {

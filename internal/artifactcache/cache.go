@@ -21,6 +21,7 @@ type Entry struct {
 	Body      io.ReadCloser
 	SHA256    string
 	Size      int64
+	StoredAt  time.Time
 	ExpiresAt time.Time
 }
 
@@ -33,6 +34,7 @@ type PutRequest struct {
 	Body      io.Reader
 	SHA256    string
 	Size      int64
+	StoredAt  time.Time
 	ExpiresAt time.Time
 }
 
@@ -55,7 +57,7 @@ func SafeHeaders(headers http.Header) http.Header {
 	safe := make(http.Header)
 	for key, values := range headers {
 		switch strings.ToLower(key) {
-		case "cache-control", "content-disposition", "content-type", "digest", "etag", "last-modified":
+		case "age", "cache-control", "content-disposition", "content-type", "date", "digest", "etag", "last-modified":
 			for _, value := range values {
 				safe.Add(key, value)
 			}
@@ -74,8 +76,14 @@ func ValidatePut(req PutRequest) error {
 	if !validSHA256(req.SHA256) {
 		return errors.Join(ErrInvalidEntry, errors.New("sha256 must be a 64-character hexadecimal digest"))
 	}
+	if req.StoredAt.IsZero() {
+		return errors.Join(ErrInvalidEntry, errors.New("stored_at is required"))
+	}
 	if req.ExpiresAt.IsZero() {
 		return errors.Join(ErrInvalidEntry, errors.New("expires_at is required"))
+	}
+	if !req.ExpiresAt.After(req.StoredAt) {
+		return errors.Join(ErrInvalidEntry, errors.New("expires_at must be after stored_at"))
 	}
 	return nil
 }
@@ -88,6 +96,7 @@ func ValidateEntry(entry Entry) error {
 		Body:      entry.Body,
 		SHA256:    entry.SHA256,
 		Size:      entry.Size,
+		StoredAt:  entry.StoredAt,
 		ExpiresAt: entry.ExpiresAt,
 	})
 }

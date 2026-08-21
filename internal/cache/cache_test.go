@@ -68,3 +68,22 @@ func TestCacheExpiredEntriesDoNotPreventBoundedInsert(t *testing.T) {
 		t.Fatalf("fresh = %d, %v; want 2, true", got, ok)
 	}
 }
+
+func TestCacheExpiredEntriesDoNotGrowEvictionOrder(t *testing.T) {
+	c := NewWithMaxEntries[int](1)
+	for i := 0; i < 3; i++ {
+		c.Set("same", i, time.Nanosecond)
+		time.Sleep(time.Millisecond)
+		if _, ok := c.Get("same"); ok {
+			t.Fatal("expected expired key to be absent")
+		}
+	}
+
+	c.Set("same", 10, 0)
+	if len(c.order) != 1 {
+		t.Fatalf("order length = %d, want 1", len(c.order))
+	}
+	if got, ok := c.Get("same"); !ok || got != 10 {
+		t.Fatalf("same = %d, %v; want 10, true", got, ok)
+	}
+}

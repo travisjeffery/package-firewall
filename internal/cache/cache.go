@@ -34,7 +34,7 @@ func (c *Cache[T]) Get(key string) (T, bool) {
 		return zero, false
 	}
 	if !item.expiresAt.IsZero() && time.Now().After(item.expiresAt) {
-		delete(c.items, key)
+		c.delete(key)
 		return zero, false
 	}
 	return item.value, true
@@ -69,5 +69,15 @@ func (c *Cache[T]) enforceMaxEntries() {
 		key := c.order[0]
 		c.order = c.order[1:]
 		delete(c.items, key)
+	}
+}
+
+func (c *Cache[T]) delete(key string) {
+	delete(c.items, key)
+	for i := 0; i < len(c.order); i++ {
+		if c.order[i] == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			i--
+		}
 	}
 }

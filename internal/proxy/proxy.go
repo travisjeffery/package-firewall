@@ -33,9 +33,10 @@ const (
 )
 
 var (
-	errObjectTooLarge         = errors.New("artifact exceeds cache object limit")
-	errUnsafeUpstreamRedirect = errors.New("upstream redirect changes origin")
-	errUpstreamRedirectLimit  = errors.New("upstream redirect limit exceeded")
+	errObjectTooLarge           = errors.New("artifact exceeds cache object limit")
+	errUnsafeUpstreamRedirect   = errors.New("upstream redirect changes origin")
+	errUpstreamRedirectLimit    = errors.New("upstream redirect limit exceeded")
+	errUnreplayableBodyRedirect = errors.New("upstream redirect requires replaying a streaming request body")
 )
 
 type CacheMetrics interface {
@@ -627,7 +628,19 @@ func representationVaries(headers http.Header) bool {
 }
 
 func (p *Proxy) do(request *http.Request, route config.RouteConfig) (*http.Response, error) {
-	checkRedirect, err := upstreamRedirectPolicy(route.AllowedRedirectOrigins)
+	checkRedirect, err := upstreamRedirectPolicy(
+		route.EnforceRedirectOrigins,
+		route.AllowedRedirectOrigins,
+		func(initialOrigin, redirectOrigin string) {
+			p.logger.Info(
+				"upstream_cross_origin_redirect",
+				"route", route.Name,
+				"initial_origin", initialOrigin,
+				"redirect_origin", redirectOrigin,
+				"enforced", route.EnforceRedirectOrigins,
+			)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -647,10 +660,18 @@ func (p *Proxy) do(request *http.Request, route config.RouteConfig) (*http.Respo
 		}
 		return nil
 	}
-	return client.Do(request)
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateReturnedRedirect(request, response, checkRedirect); err != nil {
+		_ = response.Body.Close()
+		return nil, err
+	}
+	return response, nil
 }
 
-func upstreamRedirectPolicy(allowedOrigins []string) (func(*http.Request, []*http.Request) error, error) {
+func upstreamRedirectPolicy(enforce bool, allowedOrigins []string, observe func(string, string)) (func(*http.Request, []*http.Request) error, error) {
 	allowed := make(map[string]struct{}, len(allowedOrigins))
 	for _, value := range allowedOrigins {
 		origin, err := config.NormalizeHTTPOrigin(value)
@@ -677,11 +698,38 @@ func upstreamRedirectPolicy(allowedOrigins []string) (func(*http.Request, []*htt
 		if redirectOrigin == initialOrigin {
 			return nil
 		}
+		if observe != nil {
+			observe(initialOrigin, redirectOrigin)
+		}
+		if !enforce {
+			return nil
+		}
 		if _, ok := allowed[redirectOrigin]; ok {
 			return nil
 		}
 		return fmt.Errorf("%w from %q to %q", errUnsafeUpstreamRedirect, initialOrigin, redirectOrigin)
 	}, nil
+}
+
+func validateReturnedRedirect(request *http.Request, response *http.Response, checkRedirect func(*http.Request, []*http.Request) error) error {
+	if response.StatusCode != http.StatusTemporaryRedirect && response.StatusCode != http.StatusPermanentRedirect {
+		return nil
+	}
+	location, err := response.Location()
+	if errors.Is(err, http.ErrNoLocation) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("invalid upstream redirect location: %w", err)
+	}
+	redirected := &http.Request{URL: location}
+	if err := checkRedirect(redirected, []*http.Request{request}); err != nil {
+		return err
+	}
+	if request.Body != nil && request.Body != http.NoBody && request.GetBody == nil {
+		return errUnreplayableBodyRedirect
+	}
+	return nil
 }
 
 func requestOrigin(value *url.URL) (string, error) {

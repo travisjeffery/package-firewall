@@ -63,7 +63,10 @@ func TestLiveKubernetesDependencies(t *testing.T) {
 			"GONOSUMDB=*",
 			"GOMODCACHE="+filepath.Join(tmp, "gomodcache"),
 			"GOCACHE="+filepath.Join(tmp, "gocache"),
-		), "go", "mod", "download", "k8s.io/apimachinery@v0.30.0")
+		), "go", "mod", "download",
+			"k8s.io/apimachinery@v0.30.0",
+			"github.com/klauspost/compress@v1.13.5",
+		)
 	})
 
 	t.Run("maven-http", func(t *testing.T) {

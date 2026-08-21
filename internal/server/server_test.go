@@ -49,6 +49,46 @@ func TestServerBlocksDeniedArtifactBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestServerClearsUpstreamHeadersBeforeGatewayError(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Routes = []config.RouteConfig{{
+		Name:        "npm",
+		Ecosystem:   "npm",
+		PathPrefix:  "/npm/",
+		UpstreamURL: "https://registry.example/",
+	}}
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(cfg, engine, intel.NoopProvider{})
+	server.proxy = proxy.New(
+		cfg.Server.PublicBaseURL,
+		proxy.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/json"}, "Content-Encoding": []string{"gzip"}, "Content-Length": []string{"100"}, "ETag": []string{"upstream"}},
+				Body:          io.NopCloser(failingReader{}),
+				ContentLength: 100,
+				Request:       request,
+			}, nil
+		})}),
+	)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/pkg", nil)
+	server.routesHandler().ServeHTTP(recorder, request)
+	assertGatewayError(t, recorder, http.StatusBadGateway, "upstream_error")
+	if recorder.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("Content-Type = %q", recorder.Header().Get("Content-Type"))
+	}
+	for _, name := range []string{"Content-Encoding", "Content-Length", "ETag"} {
+		if value := recorder.Header().Get(name); value != "" {
+			t.Fatalf("%s = %q", name, value)
+		}
+	}
+}
+
 func TestServerSupportsNPMRootTarballFallback(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/is-number/-/is-number-7.0.0.tgz" {
@@ -93,10 +133,11 @@ func TestServerReturnsBadGatewayForRejectedRedirect(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.PublicBaseURL = "http://firewall.test"
 	cfg.Routes = []config.RouteConfig{{
-		Name:        "npm",
-		Ecosystem:   "npm",
-		PathPrefix:  "/npm/",
-		UpstreamURL: upstream.URL + "/",
+		Name:                   "npm",
+		Ecosystem:              "npm",
+		PathPrefix:             "/npm/",
+		UpstreamURL:            upstream.URL + "/",
+		EnforceRedirectOrigins: true,
 	}}
 	engine, err := policy.New(policy.Config{})
 	if err != nil {

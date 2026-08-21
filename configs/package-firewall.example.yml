@@ -50,6 +50,8 @@ routes:
     ecosystem: npm
     path_prefix: /npm/
     upstream_url: https://registry.npmjs.org/
+    # Cross-origin redirects are observed in origin-only logs by default.
+    # enforce_redirect_origins: true
     # allowed_redirect_origins:
     #   - https://cdn.example.com
   - name: pypi

@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -83,7 +86,7 @@ func TestUpstreamURLPreservesSafeRouteBasePath(t *testing.T) {
 }
 
 func TestUpstreamRedirectPolicyStopsAfterTenHops(t *testing.T) {
-	checkRedirect, err := upstreamRedirectPolicy(nil)
+	checkRedirect, err := upstreamRedirectPolicy(false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +102,7 @@ func TestUpstreamRedirectPolicyStopsAfterTenHops(t *testing.T) {
 }
 
 func TestUpstreamRedirectPolicyRejectsSchemeChange(t *testing.T) {
-	checkRedirect, err := upstreamRedirectPolicy(nil)
+	checkRedirect, err := upstreamRedirectPolicy(true, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +126,12 @@ func TestProxyRejectsUnapprovedRedirectOrigin(t *testing.T) {
 	defer upstream.Close()
 
 	proxy := New("http://firewall.test")
-	route := config.RouteConfig{Ecosystem: "npm", PathPrefix: "/npm/", UpstreamURL: upstream.URL + "/"}
+	route := config.RouteConfig{
+		Ecosystem:              "npm",
+		PathPrefix:             "/npm/",
+		UpstreamURL:            upstream.URL + "/",
+		EnforceRedirectOrigins: true,
+	}
 	request := httptest.NewRequest(http.MethodGet, "/npm/pkg", nil)
 	_, err := proxy.Serve(httptest.NewRecorder(), request, route, registry.RequestInfo{UpstreamPath: "/pkg"})
 	if !errors.Is(err, errUnsafeUpstreamRedirect) {
@@ -131,6 +139,47 @@ func TestProxyRejectsUnapprovedRedirectOrigin(t *testing.T) {
 	}
 	if targetHit {
 		t.Fatal("unapproved redirect target was reached")
+	}
+}
+
+func TestProxyAllowsAndObservesCrossOriginRedirectByDefault(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer target.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/pkg", http.StatusFound)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	proxy := New(
+		"http://firewall.test",
+		WithLogger(slog.New(slog.NewJSONHandler(&logs, nil))),
+	)
+	route := config.RouteConfig{Name: "npm", Ecosystem: "npm", PathPrefix: "/npm/", UpstreamURL: upstream.URL + "/"}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/pkg", nil)
+	if _, err := proxy.Serve(recorder, request, route, registry.RequestInfo{UpstreamPath: "/pkg"}); err != nil {
+		t.Fatal(err)
+	}
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "ok" {
+		t.Fatalf("status = %d body = %q", recorder.Code, recorder.Body.String())
+	}
+	var event map[string]any
+	if err := json.NewDecoder(&logs).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	initialOrigin, err := config.NormalizeHTTPOrigin(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirectOrigin, err := config.NormalizeHTTPOrigin(target.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event["msg"] != "upstream_cross_origin_redirect" || event["route"] != "npm" || event["initial_origin"] != initialOrigin || event["redirect_origin"] != redirectOrigin || event["enforced"] != false {
+		t.Fatalf("event = %#v", event)
 	}
 }
 
@@ -174,6 +223,7 @@ func TestProxyAllowsConfiguredRedirectOrigin(t *testing.T) {
 		Ecosystem:              "npm",
 		PathPrefix:             "/npm/",
 		UpstreamURL:            upstream.URL + "/",
+		EnforceRedirectOrigins: true,
 		AllowedRedirectOrigins: []string{target.URL},
 	}
 	recorder := httptest.NewRecorder()
@@ -183,6 +233,35 @@ func TestProxyAllowsConfiguredRedirectOrigin(t *testing.T) {
 	}
 	if recorder.Code != http.StatusOK || recorder.Body.String() != "ok" {
 		t.Fatalf("status = %d body = %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestProxyRejectsRedirectThatRequiresReplayingStreamingBody(t *testing.T) {
+	targetHit := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/upload")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer upstream.Close()
+
+	proxy := New("http://firewall.test")
+	route := config.RouteConfig{Ecosystem: "npm", PathPrefix: "/npm/", UpstreamURL: upstream.URL + "/"}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/npm/pkg", strings.NewReader("body"))
+	_, err := proxy.Serve(recorder, request, route, registry.RequestInfo{UpstreamPath: "/pkg"})
+	if !errors.Is(err, errUnreplayableBodyRedirect) {
+		t.Fatalf("error = %v", err)
+	}
+	if targetHit {
+		t.Fatal("redirect target was reached")
+	}
+	if location := recorder.Header().Get("Location"); location != "" {
+		t.Fatalf("Location = %q", location)
 	}
 }
 

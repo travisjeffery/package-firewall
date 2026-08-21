@@ -70,7 +70,16 @@ func TestValidateUpstreamTimeouts(t *testing.T) {
 		}, want: "upstream.request_timeout must be positive"},
 		{name: "request timeout leaves response window", configure: func(cfg *Config) {
 			cfg.Upstream.RequestTimeout = cfg.Server.WriteTimeout
-		}, want: "upstream.request_timeout must be less than server.write_timeout"},
+		}, want: "server.write_timeout must exceed the combined active"},
+		{name: "request timeout leaves intelligence window", configure: func(cfg *Config) {
+			cfg.Upstream.RequestTimeout = Duration(9*time.Minute + 55*time.Second)
+		}, want: "server.write_timeout must exceed the combined active"},
+		{name: "request timeout leaves cache read window", configure: func(cfg *Config) {
+			cfg.Intel.OSV.Enabled = false
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/cache"
+			cfg.Cache.ReadTimeout = Duration(2 * time.Minute)
+		}, want: "server.write_timeout must exceed the combined active"},
 		{name: "response header timeout required", configure: func(cfg *Config) {
 			cfg.Upstream.ResponseHeaderTimeout = 0
 		}, want: "upstream.response_header_timeout must be positive"},
@@ -88,6 +97,15 @@ func TestValidateUpstreamTimeouts(t *testing.T) {
 				t.Fatalf("error = %v want substring %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestValidateTimeoutBudgetIncludesOnlyEnabledWork(t *testing.T) {
+	cfg := Default()
+	cfg.Intel.OSV.Enabled = false
+	cfg.Upstream.RequestTimeout = Duration(9*time.Minute + 59*time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }
 

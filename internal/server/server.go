@@ -140,6 +140,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		if result.StatusCode == 0 && !errors.Is(err, context.Canceled) {
 			status, code, message := upstreamErrorResponse(err)
 			event.UpstreamStatus = status
+			clear(w.Header())
+			w.Header().Set("X-Request-ID", requestID)
 			writeJSON(w, status, errorBody(code, message, requestID))
 		}
 		s.audit.Log(event)

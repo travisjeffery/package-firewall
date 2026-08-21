@@ -120,7 +120,7 @@ See `configs/package-firewall.example.yml`.
 
 Important settings:
 
-- `upstream.request_timeout`: total upstream request lifetime, including redirects and the complete response body; it must be shorter than `server.write_timeout`.
+- `upstream.request_timeout`: total upstream request lifetime, including redirects and the complete response body; the server write timeout must also leave room for enabled intelligence and cache reads.
 - `upstream.response_header_timeout`: maximum wait for upstream response headers.
 - `cache.backend`: `none`, `filesystem`, or `s3`.
 - `cache.artifact_ttl`: freshness lifetime stored with each cached artifact.
@@ -131,7 +131,8 @@ Important settings:
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
-- `routes[].allowed_redirect_origins`: exact additional HTTP(S) origins allowed for upstream redirects; redirects otherwise remain on the original origin and stop after ten hops.
+- `routes[].enforce_redirect_origins`: opt in to keeping redirects on the original origin plus the exact origins configured for the route; disabled by default while required origins are observed.
+- `routes[].allowed_redirect_origins`: exact additional HTTP(S) origins accepted when redirect-origin enforcement is enabled.
 - `auth.bearer_token_env` and `auth.basic_*_env`: require clients to authenticate to the firewall.
 
 Upstream timeouts can be supplied with `PFW_UPSTREAM_REQUEST_TIMEOUT` and
@@ -141,6 +142,11 @@ Upstream timeouts can be supplied with `PFW_UPSTREAM_REQUEST_TIMEOUT` and
 `PFW_CACHE_STORE_TIMEOUT`, `PFW_CACHE_FILESYSTEM_DIRECTORY`,
 `PFW_CACHE_S3_BUCKET`, `PFW_CACHE_S3_PREFIX`, and
 `PFW_CACHE_S3_EXPECTED_BUCKET_OWNER`.
+
+Cross-origin redirects are followed by default and logged as
+`upstream_cross_origin_redirect` with normalized origin-only fields. Redirects
+still stop after ten hops. Use these records to build a route allowlist before
+enabling `enforce_redirect_origins`.
 
 ## Artifact Cache Safety
 

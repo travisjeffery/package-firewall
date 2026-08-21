@@ -96,6 +96,7 @@ type RouteConfig struct {
 	UpstreamURL            string   `yaml:"upstream_url"`
 	FileUpstreamURL        string   `yaml:"file_upstream_url"`
 	UpstreamTokenEnv       string   `yaml:"upstream_token_env"`
+	EnforceRedirectOrigins bool     `yaml:"enforce_redirect_origins"`
 	AllowedRedirectOrigins []string `yaml:"allowed_redirect_origins"`
 }
 
@@ -270,8 +271,6 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.Upstream.RequestTimeout <= 0 {
 		errs = append(errs, errors.New("upstream.request_timeout must be positive"))
-	} else if cfg.Server.WriteTimeout > 0 && cfg.Upstream.RequestTimeout >= cfg.Server.WriteTimeout {
-		errs = append(errs, errors.New("upstream.request_timeout must be less than server.write_timeout"))
 	}
 	if cfg.Upstream.ResponseHeaderTimeout <= 0 {
 		errs = append(errs, errors.New("upstream.response_header_timeout must be positive"))
@@ -332,6 +331,19 @@ func (cfg Config) Validate() error {
 			errs = append(errs, errors.New("intel.osv.cache_ttl must be positive"))
 		}
 	}
+	requestBudget := []time.Duration{cfg.Upstream.RequestTimeout.Std()}
+	requestBudgetValid := cfg.Server.WriteTimeout > 0 && cfg.Upstream.RequestTimeout > 0
+	if cfg.Intel.OSV.Enabled {
+		requestBudget = append(requestBudget, cfg.Intel.OSV.Timeout.Std())
+		requestBudgetValid = requestBudgetValid && cfg.Intel.OSV.Timeout > 0
+	}
+	if cfg.Cache.Backend == "filesystem" || cfg.Cache.Backend == "s3" {
+		requestBudget = append(requestBudget, cfg.Cache.ReadTimeout.Std())
+		requestBudgetValid = requestBudgetValid && cfg.Cache.ReadTimeout > 0
+	}
+	if requestBudgetValid && !durationBudgetFits(cfg.Server.WriteTimeout.Std(), requestBudget...) {
+		errs = append(errs, errors.New("server.write_timeout must exceed the combined active intelligence, cache read, and upstream request timeout budget"))
+	}
 	if len(cfg.Routes) == 0 {
 		errs = append(errs, errors.New("at least one route is required"))
 	}
@@ -362,6 +374,17 @@ func (cfg Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func durationBudgetFits(total time.Duration, parts ...time.Duration) bool {
+	remaining := total
+	for _, part := range parts {
+		if part <= 0 || part >= remaining {
+			return false
+		}
+		remaining -= part
+	}
+	return true
 }
 
 func validateEnabledCache(cfg CacheConfig) []error {

@@ -17,7 +17,7 @@ func identifyPyPI(route Route, relative string, info RequestInfo) RequestInfo {
 		info.Kind = "artifact"
 		filename := lastPathPart(relative)
 		name, version := parsePyPIFile(filename)
-		info.NeedsDecision = version != ""
+		info.NeedsDecision = true
 		info.Package = policy.Package{
 			Ecosystem: route.Ecosystem,
 			Name:      normalizePyPI(name),

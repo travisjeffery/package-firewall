@@ -24,12 +24,19 @@ import (
 )
 
 const (
-	cacheHeader              = "X-Package-Firewall-Cache"
-	defaultCacheReadTimeout  = 30 * time.Second
-	defaultCacheStoreTimeout = 10 * time.Minute
+	cacheHeader                          = "X-Package-Firewall-Cache"
+	defaultCacheReadTimeout              = 30 * time.Second
+	defaultCacheStoreTimeout             = 10 * time.Minute
+	defaultUpstreamRequestTimeout        = 9 * time.Minute
+	defaultUpstreamResponseHeaderTimeout = 30 * time.Second
+	maxUpstreamRedirects                 = 10
 )
 
-var errObjectTooLarge = errors.New("artifact exceeds cache object limit")
+var (
+	errObjectTooLarge         = errors.New("artifact exceeds cache object limit")
+	errUnsafeUpstreamRedirect = errors.New("upstream redirect changes origin")
+	errUpstreamRedirectLimit  = errors.New("upstream redirect limit exceeded")
+)
 
 type CacheMetrics interface {
 	Hit(route string)
@@ -94,7 +101,7 @@ type Proxy struct {
 
 func New(baseURL string, options ...Option) *Proxy {
 	proxy := &Proxy{
-		client:     &http.Client{Timeout: 0},
+		client:     NewHTTPClient(defaultUpstreamRequestTimeout, defaultUpstreamResponseHeaderTimeout),
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		logger:     slog.Default(),
 		createTemp: createCacheTemp,
@@ -108,6 +115,20 @@ func New(baseURL string, options ...Option) *Proxy {
 		option(proxy)
 	}
 	return proxy
+}
+
+// NewHTTPClient returns a reusable upstream client with bounded header and
+// complete-response lifetimes.
+func NewHTTPClient(requestTimeout, responseHeaderTimeout time.Duration) *http.Client {
+	if requestTimeout <= 0 {
+		requestTimeout = defaultUpstreamRequestTimeout
+	}
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = defaultUpstreamResponseHeaderTimeout
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{Transport: transport, Timeout: requestTimeout}
 }
 
 type Result struct {
@@ -157,7 +178,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 	}
-	resp, err := p.client.Do(req)
+	resp, err := p.do(req, route)
 	if err != nil {
 		return Result{}, err
 	}
@@ -603,6 +624,75 @@ func representationVaries(headers http.Header) bool {
 		}
 	}
 	return false
+}
+
+func (p *Proxy) do(request *http.Request, route config.RouteConfig) (*http.Response, error) {
+	checkRedirect, err := upstreamRedirectPolicy(route.AllowedRedirectOrigins)
+	if err != nil {
+		return nil, err
+	}
+	client := *p.client
+	configuredCheck := client.CheckRedirect
+	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if err := checkRedirect(request, via); err != nil {
+			return err
+		}
+		if configuredCheck != nil {
+			if err := configuredCheck(request, via); err != nil {
+				if errors.Is(err, http.ErrUseLastResponse) {
+					return errors.New("configured redirect policy stopped redirect")
+				}
+				return err
+			}
+		}
+		return nil
+	}
+	return client.Do(request)
+}
+
+func upstreamRedirectPolicy(allowedOrigins []string) (func(*http.Request, []*http.Request) error, error) {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, value := range allowedOrigins {
+		origin, err := config.NormalizeHTTPOrigin(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid allowed redirect origin %q: %w", value, err)
+		}
+		allowed[origin] = struct{}{}
+	}
+	return func(request *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return errors.Join(errUnsafeUpstreamRedirect, errors.New("initial upstream request is missing"))
+		}
+		if len(via) >= maxUpstreamRedirects {
+			return fmt.Errorf("%w after %d redirects", errUpstreamRedirectLimit, len(via))
+		}
+		initialOrigin, err := requestOrigin(via[0].URL)
+		if err != nil {
+			return errors.Join(errUnsafeUpstreamRedirect, err)
+		}
+		redirectOrigin, err := requestOrigin(request.URL)
+		if err != nil {
+			return errors.Join(errUnsafeUpstreamRedirect, err)
+		}
+		if redirectOrigin == initialOrigin {
+			return nil
+		}
+		if _, ok := allowed[redirectOrigin]; ok {
+			return nil
+		}
+		return fmt.Errorf("%w from %q to %q", errUnsafeUpstreamRedirect, initialOrigin, redirectOrigin)
+	}, nil
+}
+
+func requestOrigin(value *url.URL) (string, error) {
+	if value == nil {
+		return "", errors.New("redirect URL is missing")
+	}
+	if value.User != nil {
+		return "", errors.New("redirect URL must not include user information")
+	}
+	origin := (&url.URL{Scheme: value.Scheme, Host: value.Host}).String()
+	return config.NormalizeHTTPOrigin(origin)
 }
 
 func upstreamURL(route config.RouteConfig, info registry.RequestInfo) (string, error) {

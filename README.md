@@ -120,6 +120,8 @@ See `configs/package-firewall.example.yml`.
 
 Important settings:
 
+- `upstream.request_timeout`: total upstream request lifetime, including redirects and the complete response body; it must be shorter than `server.write_timeout`.
+- `upstream.response_header_timeout`: maximum wait for upstream response headers.
 - `cache.backend`: `none`, `filesystem`, or `s3`.
 - `cache.artifact_ttl`: freshness lifetime stored with each cached artifact.
 - `cache.max_object_size`: maximum artifact bytes ever written to temporary cache storage.
@@ -129,9 +131,11 @@ Important settings:
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
+- `routes[].allowed_redirect_origins`: exact additional HTTP(S) origins allowed for upstream redirects; redirects otherwise remain on the original origin and stop after ten hops.
 - `auth.bearer_token_env` and `auth.basic_*_env`: require clients to authenticate to the firewall.
 
-Cache settings can also be supplied with `PFW_CACHE_BACKEND`,
+Upstream timeouts can be supplied with `PFW_UPSTREAM_REQUEST_TIMEOUT` and
+`PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT`. Cache settings can be supplied with `PFW_CACHE_BACKEND`,
 `PFW_CACHE_ARTIFACT_TTL`, `PFW_CACHE_MAX_OBJECT_SIZE`,
 `PFW_CACHE_TEMP_DIRECTORY`, `PFW_CACHE_READ_TIMEOUT`,
 `PFW_CACHE_STORE_TIMEOUT`, `PFW_CACHE_FILESYSTEM_DIRECTORY`,

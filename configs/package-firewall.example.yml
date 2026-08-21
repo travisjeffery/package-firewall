@@ -5,6 +5,10 @@ server:
   shutdown_timeout: 10s
   public_base_url: "http://localhost:8080"
 
+upstream:
+  request_timeout: 9m # includes redirects and reading the complete response body
+  response_header_timeout: 30s
+
 auth:
   bearer_token_env: ""
   basic_username_env: ""
@@ -46,6 +50,8 @@ routes:
     ecosystem: npm
     path_prefix: /npm/
     upstream_url: https://registry.npmjs.org/
+    # allowed_redirect_origins:
+    #   - https://cdn.example.com
   - name: pypi
     ecosystem: pypi
     path_prefix: /pypi/

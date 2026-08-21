@@ -386,7 +386,9 @@ func TestProxyDoesNotCacheRedirectedArtifact(t *testing.T) {
 	proxy := newTestCachingProxy(t, store, metrics, 1024)
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
-	if _, err := proxy.Serve(recorder, request, testNPMRoute(upstream.URL), exactArtifactInfo()); err != nil {
+	route := testNPMRoute(upstream.URL)
+	route.AllowedRedirectOrigins = []string{final.URL}
+	if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
 		t.Fatal(err)
 	}
 	if recorder.Code != http.StatusOK || recorder.Body.String() != "redirected-artifact" {

@@ -3,6 +3,7 @@ package live_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -101,6 +102,48 @@ func TestLiveBlocksDeniedKubernetesDependency(t *testing.T) {
 	}
 }
 
+func TestLiveFilesystemArtifactCache(t *testing.T) {
+	if os.Getenv("PFW_LIVE") != "1" {
+		t.Skip("set PFW_LIVE=1 to run live package-manager smoke tests")
+	}
+	root := repoRoot(t)
+	tmp := t.TempDir()
+	chmodTempOnCleanup(t, tmp)
+	t.Setenv("PFW_CACHE_BACKEND", "filesystem")
+	t.Setenv("PFW_CACHE_FILESYSTEM_DIRECTORY", filepath.Join(tmp, "artifact-cache"))
+	t.Setenv("PFW_CACHE_TEMP_DIRECTORY", filepath.Join(tmp, "stage"))
+	baseURL := startFirewall(t, root, tmp, "configs/package-firewall.example.yml")
+	artifactURL := baseURL + "/maven/io/kubernetes/client-java/21.0.2/client-java-21.0.2.pom"
+	var firstBody []byte
+	for requestNumber, wantCacheStatus := range []string{"MISS", "HIT"} {
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, artifactURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Accept-Encoding", "identity")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatal(errors.Join(readErr, closeErr))
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d body = %s", requestNumber, response.StatusCode, string(body))
+		}
+		if got := response.Header.Get("X-Package-Firewall-Cache"); got != wantCacheStatus {
+			t.Fatalf("request %d cache status = %q want %q", requestNumber, got, wantCacheStatus)
+		}
+		if requestNumber == 0 {
+			firstBody = body
+		} else if !bytes.Equal(body, firstBody) {
+			t.Fatal("cache hit body differs from upstream miss body")
+		}
+	}
+}
+
 func startFirewall(t *testing.T, root string, tmp string, configPath string) string {
 	t.Helper()
 	port := freePort(t)
@@ -164,7 +207,6 @@ routes:
     ecosystem: maven
     path_prefix: /maven/
     upstream_url: https://repo1.maven.org/maven2/
-    cache_ttl: 10m
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}

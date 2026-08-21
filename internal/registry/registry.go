@@ -14,7 +14,6 @@ type Route struct {
 	UpstreamURL      string
 	FileUpstreamURL  string
 	UpstreamTokenEnv string
-	CacheTTLSeconds  int64
 }
 
 type RequestInfo struct {

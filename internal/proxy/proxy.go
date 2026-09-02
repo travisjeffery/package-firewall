@@ -16,10 +16,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/artifactcache"
 	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/package-firewall/internal/coordination"
 	"github.com/travisjeffery/package-firewall/internal/registry"
 )
 
@@ -27,6 +29,12 @@ const (
 	cacheHeader                          = "X-Package-Firewall-Cache"
 	defaultCacheReadTimeout              = 30 * time.Second
 	defaultCacheStoreTimeout             = 10 * time.Minute
+	defaultCoordinationLeaseDuration     = 30 * time.Second
+	defaultCoordinationPollInterval      = time.Second
+	defaultUpstreamMaxConcurrentRegistry = 4
+	defaultUpstreamQueueTimeout          = 15 * time.Second
+	defaultUpstreamRateLimitRetries      = 1
+	defaultUpstreamMaxRetryAfter         = 30 * time.Second
 	defaultUpstreamRequestTimeout        = 9 * time.Minute
 	defaultUpstreamResponseHeaderTimeout = 30 * time.Second
 	maxUpstreamRedirects                 = 10
@@ -57,6 +65,19 @@ type CacheConfig struct {
 	Metrics       CacheMetrics
 }
 
+type CoordinationConfig struct {
+	Coordinator   coordination.Coordinator
+	LeaseDuration time.Duration
+	PollInterval  time.Duration
+}
+
+type UpstreamProtectionConfig struct {
+	MaxConcurrentPerRegistry int
+	QueueTimeout             time.Duration
+	RateLimitRetries         int
+	MaxRetryAfter            time.Duration
+}
+
 type Option func(*Proxy)
 
 func WithCache(cfg CacheConfig) Option {
@@ -82,6 +103,36 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
+func WithCoordination(cfg CoordinationConfig) Option {
+	return func(proxy *Proxy) {
+		proxy.coordination = cfg
+		if proxy.coordination.LeaseDuration <= 0 {
+			proxy.coordination.LeaseDuration = defaultCoordinationLeaseDuration
+		}
+		if proxy.coordination.PollInterval <= 0 {
+			proxy.coordination.PollInterval = defaultCoordinationPollInterval
+		}
+	}
+}
+
+func WithUpstreamProtection(cfg UpstreamProtectionConfig) Option {
+	return func(proxy *Proxy) {
+		proxy.upstream = cfg
+		if proxy.upstream.MaxConcurrentPerRegistry <= 0 {
+			proxy.upstream.MaxConcurrentPerRegistry = defaultUpstreamMaxConcurrentRegistry
+		}
+		if proxy.upstream.QueueTimeout <= 0 {
+			proxy.upstream.QueueTimeout = defaultUpstreamQueueTimeout
+		}
+		if proxy.upstream.RateLimitRetries < 0 {
+			proxy.upstream.RateLimitRetries = defaultUpstreamRateLimitRetries
+		}
+		if proxy.upstream.MaxRetryAfter <= 0 {
+			proxy.upstream.MaxRetryAfter = defaultUpstreamMaxRetryAfter
+		}
+	}
+}
+
 func WithLogger(logger *slog.Logger) Option {
 	return func(proxy *Proxy) {
 		if logger != nil {
@@ -91,13 +142,20 @@ func WithLogger(logger *slog.Logger) Option {
 }
 
 type Proxy struct {
-	client     *http.Client
-	baseURL    string
-	cache      CacheConfig
-	logger     *slog.Logger
-	createTemp func(string, string) (*os.File, error)
-	now        func() time.Time
-	startStore func(func())
+	client       *http.Client
+	baseURL      string
+	cache        CacheConfig
+	coordination CoordinationConfig
+	upstream     UpstreamProtectionConfig
+	fills        fillGroup
+	limiters     routeLimiters
+	cooldowns    routeCooldowns
+	logger       *slog.Logger
+	createTemp   func(string, string) (*os.File, error)
+	now          func() time.Time
+	wait         func(context.Context, time.Duration) error
+	jitter       func(time.Duration) time.Duration
+	startStore   func(func())
 }
 
 func New(baseURL string, options ...Option) *Proxy {
@@ -111,6 +169,18 @@ func New(baseURL string, options ...Option) *Proxy {
 		cache: CacheConfig{
 			Metrics: noopCacheMetrics{},
 		},
+		coordination: CoordinationConfig{
+			LeaseDuration: defaultCoordinationLeaseDuration,
+			PollInterval:  defaultCoordinationPollInterval,
+		},
+		upstream: UpstreamProtectionConfig{
+			MaxConcurrentPerRegistry: defaultUpstreamMaxConcurrentRegistry,
+			QueueTimeout:             defaultUpstreamQueueTimeout,
+			RateLimitRetries:         defaultUpstreamRateLimitRetries,
+			MaxRetryAfter:            defaultUpstreamMaxRetryAfter,
+		},
+		wait:   waitContext,
+		jitter: randomJitter,
 	}
 	for _, option := range options {
 		option(proxy)
@@ -161,17 +231,31 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 			p.logger.Warn("artifact_cache_read_failed", "route", route.Name, "error", cacheErr)
 		}
 		w.Header().Set(cacheHeader, "MISS")
+		return p.serveCacheMiss(w, r, route, target, cacheKey)
 	} else {
 		p.cache.Metrics.Bypass(route.Name, bypassReason)
 		w.Header().Set(cacheHeader, "BYPASS")
 	}
+	return p.serveUpstream(w, r, route, target, "", nil)
+}
 
+func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route config.RouteConfig, target, cacheKey string, complete func()) (Result, error) {
+	if complete == nil {
+		complete = func() {}
+	}
+	complete = sync.OnceFunc(complete)
+	storeOwnsCompletion := false
+	defer func() {
+		if !storeOwnsCompletion {
+			complete()
+		}
+	}()
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 	if err != nil {
 		return Result{}, err
 	}
 	copyRequestHeaders(req.Header, r.Header)
-	if bypassReason == "" {
+	if cacheKey != "" {
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 	if route.UpstreamTokenEnv != "" {
@@ -186,7 +270,7 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 	defer resp.Body.Close()
 	copyResponseHeaders(w.Header(), resp.Header)
 	if p.shouldRewrite(route, resp) {
-		if bypassReason == "" {
+		if cacheKey != "" {
 			p.cache.Metrics.Bypass(route.Name, "response_rewrite")
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
@@ -199,9 +283,10 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 		_, err = io.Copy(w, bytes.NewReader(body))
 		return Result{StatusCode: resp.StatusCode}, err
 	}
-	if bypassReason == "" {
+	if cacheKey != "" {
 		if responseReason := p.responseBypassReason(resp, target); responseReason == "" {
-			return p.serveAndStore(w, route, resp, cacheKey)
+			storeOwnsCompletion = true
+			return p.serveAndStore(w, route, resp, cacheKey, complete)
 		} else {
 			p.cache.Metrics.Bypass(route.Name, responseReason)
 		}
@@ -367,7 +452,13 @@ func agedHeaders(headers http.Header, storedAt, now time.Time) http.Header {
 	return aged
 }
 
-func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, resp *http.Response, key string) (Result, error) {
+func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, resp *http.Response, key string, complete func()) (Result, error) {
+	storeOwnsCompletion := false
+	defer func() {
+		if !storeOwnsCompletion {
+			complete()
+		}
+	}()
 	temporary, err := p.createTemp(p.cache.TempDirectory, "package-firewall-cache-miss-*")
 	if err != nil {
 		p.recordStoreError(route.Name, err)
@@ -415,7 +506,9 @@ func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, r
 	}
 	temporaryPath := temporary.Name()
 	cleanup = false
+	storeOwnsCompletion = true
 	p.startStore(func() {
+		defer complete()
 		defer func() {
 			_ = temporary.Close()
 			_ = os.Remove(temporaryPath)
@@ -627,7 +720,7 @@ func representationVaries(headers http.Header) bool {
 	return false
 }
 
-func (p *Proxy) do(request *http.Request, route config.RouteConfig) (*http.Response, error) {
+func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.Response, error) {
 	checkRedirect, err := upstreamRedirectPolicy(
 		route.EnforceRedirectOrigins,
 		route.AllowedRedirectOrigins,

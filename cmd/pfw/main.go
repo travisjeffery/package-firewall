@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/config"
 	"github.com/travisjeffery/package-firewall/internal/intel"
 	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/package-firewall/internal/prewarm"
 	"github.com/travisjeffery/package-firewall/internal/registry"
 )
 
@@ -91,13 +95,71 @@ func run(args []string) error {
 		info := registry.Identify(registry.Route{Ecosystem: *ecosystem, PathPrefix: *prefix}, *path)
 		fmt.Printf("%s\t%s\t%s\t%v\n", info.Kind, info.Package.PURL, info.UpstreamPath, info.NeedsDecision)
 		return nil
+	case "prewarm":
+		fs := flag.NewFlagSet("prewarm", flag.ExitOnError)
+		root := fs.String("root", ".", "Gradle repository root containing committed lockfiles")
+		verificationMetadata := fs.String("verification-metadata", "gradle/verification-metadata.xml", "verification metadata path relative to root")
+		baseURL := fs.String("base-url", os.Getenv("PFW_BASE_URL"), "package firewall base URL")
+		routePrefix := fs.String("route-prefix", "/maven/", "package firewall Maven route prefix")
+		concurrency := fs.Int("concurrency", 2, "maximum concurrent artifact downloads (1-16)")
+		requestTimeout := fs.Duration("request-timeout", 10*time.Minute, "per-artifact request timeout")
+		checkOnly := fs.Bool("check", false, "validate lockfile coverage without downloading artifacts")
+		bearerTokenEnv := fs.String("bearer-token-env", "", "environment variable containing the package firewall bearer token")
+		basicUsernameEnv := fs.String("basic-username-env", "", "environment variable containing the package firewall basic username")
+		basicPasswordEnv := fs.String("basic-password-env", "", "environment variable containing the package firewall basic password")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *requestTimeout <= 0 {
+			return errors.New("prewarm request timeout must be positive")
+		}
+		bearerToken, err := configuredSecret(*bearerTokenEnv)
+		if err != nil {
+			return err
+		}
+		basicUsername, err := configuredSecret(*basicUsernameEnv)
+		if err != nil {
+			return err
+		}
+		basicPassword, err := configuredSecret(*basicPasswordEnv)
+		if err != nil {
+			return err
+		}
+		manifest, err := prewarm.DiscoverGradle(*root, *verificationMetadata)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("lockfiles=%d locked_components=%d artifacts=%d\n", manifest.Lockfiles, manifest.LockedComponents, len(manifest.Artifacts))
+		if *checkOnly {
+			return nil
+		}
+		return prewarm.Run(context.Background(), prewarm.RunConfig{
+			BaseURL:       *baseURL,
+			RoutePrefix:   *routePrefix,
+			Concurrency:   *concurrency,
+			HTTPClient:    &http.Client{Timeout: *requestTimeout},
+			BearerToken:   bearerToken,
+			BasicUsername: basicUsername,
+			BasicPassword: basicPassword,
+		}, manifest.Artifacts, os.Stdout)
 	default:
 		return usage()
 	}
 }
 
 func usage() error {
-	return fmt.Errorf("usage: pfw validate|routes|decide|identify")
+	return fmt.Errorf("usage: pfw validate|routes|decide|identify|prewarm")
+}
+
+func configuredSecret(name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	value, ok := os.LookupEnv(name)
+	if !ok || value == "" {
+		return "", fmt.Errorf("configured secret environment variable %q is not set or is empty", name)
+	}
+	return value, nil
 }
 
 func loadPolicy(cfg config.Config) (*policy.Engine, error) {

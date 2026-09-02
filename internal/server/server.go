@@ -17,6 +17,7 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/audit"
 	"github.com/travisjeffery/package-firewall/internal/cachemetrics"
 	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/package-firewall/internal/coordination"
 	"github.com/travisjeffery/package-firewall/internal/intel"
 	"github.com/travisjeffery/package-firewall/internal/policy"
 	"github.com/travisjeffery/package-firewall/internal/proxy"
@@ -38,7 +39,12 @@ type Server struct {
 	authReady bool
 }
 
-func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfigs ...proxy.CacheConfig) *Server {
+type RuntimeConfig struct {
+	Cache       proxy.CacheConfig
+	Coordinator coordination.Coordinator
+}
+
+func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, runtimeConfigs ...RuntimeConfig) *Server {
 	routes := append([]config.RouteConfig(nil), cfg.Routes...)
 	sort.Slice(routes, func(i, j int) bool {
 		return len(routes[i].PathPrefix) > len(routes[j].PathPrefix)
@@ -47,11 +53,11 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 		provider = intel.NoopProvider{}
 	}
 	metrics := cachemetrics.New()
-	cacheConfig := proxy.CacheConfig{}
-	if len(cacheConfigs) > 0 {
-		cacheConfig = cacheConfigs[0]
+	runtimeConfig := RuntimeConfig{}
+	if len(runtimeConfigs) > 0 {
+		runtimeConfig = runtimeConfigs[0]
 	}
-	cacheConfig.Metrics = metrics
+	runtimeConfig.Cache.Metrics = metrics
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	bearer, bearerOK := secretFromEnv(cfg.Auth.BearerTokenEnv)
 	basicUser, basicUserOK := secretFromEnv(cfg.Auth.BasicUsernameEnv)
@@ -66,7 +72,18 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 				cfg.Upstream.RequestTimeout.Std(),
 				cfg.Upstream.ResponseHeaderTimeout.Std(),
 			)),
-			proxy.WithCache(cacheConfig),
+			proxy.WithCache(runtimeConfig.Cache),
+			proxy.WithCoordination(proxy.CoordinationConfig{
+				Coordinator:   runtimeConfig.Coordinator,
+				LeaseDuration: cfg.Coordination.LeaseDuration.Std(),
+				PollInterval:  cfg.Coordination.PollInterval.Std(),
+			}),
+			proxy.WithUpstreamProtection(proxy.UpstreamProtectionConfig{
+				MaxConcurrentPerRegistry: cfg.Upstream.MaxConcurrentPerRegistry,
+				QueueTimeout:             cfg.Upstream.QueueTimeout.Std(),
+				RateLimitRetries:         cfg.Upstream.RateLimitRetries,
+				MaxRetryAfter:            cfg.Upstream.MaxRetryAfter.Std(),
+			}),
 			proxy.WithLogger(logger),
 		),
 		metrics:   metrics,
@@ -152,6 +169,9 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func upstreamErrorResponse(err error) (int, string, string) {
+	if errors.Is(err, proxy.ErrUpstreamQueueTimeout) {
+		return http.StatusServiceUnavailable, "upstream_busy", "upstream request queue is full"
+	}
 	var timeoutError net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeoutError) && timeoutError.Timeout()) {
 		return http.StatusGatewayTimeout, "upstream_timeout", "upstream request timed out"
@@ -279,8 +299,8 @@ func constantTimeEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-func Run(ctx context.Context, cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, cacheConfigs ...proxy.CacheConfig) error {
-	srv := New(cfg, policyEngine, provider, cacheConfigs...).HTTPServer()
+func Run(ctx context.Context, cfg config.Config, policyEngine *policy.Engine, provider intel.Provider, runtimeConfigs ...RuntimeConfig) error {
+	srv := New(cfg, policyEngine, provider, runtimeConfigs...).HTTPServer()
 	errCh := make(chan error, 1)
 	go func() {
 		err := srv.ListenAndServe()

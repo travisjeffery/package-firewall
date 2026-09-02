@@ -12,12 +12,16 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/artifactcache"
 	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/package-firewall/internal/coordination"
 	"github.com/travisjeffery/package-firewall/internal/policy"
 	"github.com/travisjeffery/package-firewall/internal/registry"
 )
@@ -64,6 +68,159 @@ func TestProxyCachesIntegrityCheckedArtifact(t *testing.T) {
 	}
 	if metrics.hits["npm"] != 1 || metrics.misses["npm"] != 1 {
 		t.Fatalf("metrics: hits = %v misses = %v", metrics.hits, metrics.misses)
+	}
+}
+
+func TestProxyCoalescesConcurrentCacheMissesInProcess(t *testing.T) {
+	const requests = 24
+	var upstreamHits atomic.Int32
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if upstreamHits.Add(1) == 1 {
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		_, _ = io.WriteString(w, "artifact-body")
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	route := testNPMRoute(upstream.URL)
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	for range requests {
+		go func() {
+			<-start
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+			_, err := proxy.Serve(recorder, request, route, exactArtifactInfo())
+			if err == nil && (recorder.Code != http.StatusOK || recorder.Body.String() != "artifact-body") {
+				err = errors.New("unexpected proxy response")
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	waitForMetric(t, time.Second, func() bool { return metrics.fillWaiterCount("process") == requests-1 })
+	close(releaseUpstream)
+	for range requests {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d want 1", got)
+	}
+	if got := metrics.fillLeaderCount(); got != 1 {
+		t.Fatalf("fill leaders = %d want 1", got)
+	}
+}
+
+func TestProxyCoalescesConcurrentCacheMissesAcrossReplicas(t *testing.T) {
+	const requests = 24
+	var upstreamHits atomic.Int32
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if upstreamHits.Add(1) == 1 {
+			close(upstreamStarted)
+		}
+		<-releaseUpstream
+		_, _ = io.WriteString(w, "artifact-body")
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	coordinator := newMemoryCoordinator()
+	proxies := []*Proxy{
+		newTestCachingProxy(t, store, metrics, 1024),
+		newTestCachingProxy(t, store, metrics, 1024),
+	}
+	for _, proxy := range proxies {
+		proxy.coordination = CoordinationConfig{
+			Coordinator:   coordinator,
+			LeaseDuration: time.Minute,
+			PollInterval:  5 * time.Millisecond,
+		}
+	}
+	route := testNPMRoute(upstream.URL)
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	for index := range requests {
+		proxy := proxies[index%len(proxies)]
+		go func() {
+			<-start
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+			_, err := proxy.Serve(recorder, request, route, exactArtifactInfo())
+			if err == nil && (recorder.Code != http.StatusOK || recorder.Body.String() != "artifact-body") {
+				err = errors.New("unexpected proxy response")
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	waitForMetric(t, time.Second, func() bool { return metrics.fillWaiterCount("cluster") >= 1 })
+	close(releaseUpstream)
+	for range requests {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := upstreamHits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d want 1", got)
+	}
+	if got := metrics.fillLeaderCount(); got != 1 {
+		t.Fatalf("fill leaders = %d want 1", got)
+	}
+}
+
+func TestProxyCancelsFillWhenCoordinationLeaseCannotRenew(t *testing.T) {
+	upstreamCanceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+		close(upstreamCanceled)
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	lease := &failingRenewLease{}
+	proxy := newTestCachingProxy(t, store, newTestCacheMetrics(), 1024)
+	proxy.coordination = CoordinationConfig{
+		Coordinator:   &fixedLeaseCoordinator{lease: lease},
+		LeaseDuration: 30 * time.Millisecond,
+		PollInterval:  5 * time.Millisecond,
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+	_, err := proxy.Serve(recorder, request, testNPMRoute(upstream.URL), exactArtifactInfo())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fill error = %v want context cancellation", err)
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream fill was not canceled after lease renewal failed")
+	}
+	if !lease.released.Load() {
+		t.Fatal("coordination lease was not released")
+	}
+	if store.putCalls != 0 {
+		t.Fatalf("cache stores = %d want 0", store.putCalls)
 	}
 }
 
@@ -332,6 +489,7 @@ func TestProxyStoresOnlyUnconditional200Responses(t *testing.T) {
 	}{
 		{name: "partial status", reason: "upstream_status", status: http.StatusPartialContent, header: http.Header{"Content-Range": []string{"bytes 0-3/8"}}, body: "part", limit: 1024},
 		{name: "not found", reason: "upstream_status", status: http.StatusNotFound, body: "missing", limit: 1024},
+		{name: "rate limited", reason: "upstream_status", status: http.StatusTooManyRequests, header: http.Header{"Retry-After": []string{"60"}}, body: "rate limited", limit: 1024},
 		{name: "vary", reason: "response_vary", status: http.StatusOK, header: http.Header{"Vary": []string{"Accept"}}, body: "artifact", limit: 1024},
 		{name: "cookie", reason: "response_set_cookie", status: http.StatusOK, header: http.Header{"Set-Cookie": []string{"session=value"}}, body: "artifact", limit: 1024},
 		{name: "content range", reason: "response_content_range", status: http.StatusOK, header: http.Header{"Content-Range": []string{"bytes 0-7/8"}}, body: "artifact", limit: 1024},
@@ -681,6 +839,7 @@ type storedArtifact struct {
 }
 
 type memoryArtifactStore struct {
+	mu       sync.Mutex
 	entries  map[string]storedArtifact
 	getCalls int
 	putCalls int
@@ -691,6 +850,8 @@ func newMemoryArtifactStore() *memoryArtifactStore {
 }
 
 func (s *memoryArtifactStore) Get(_ context.Context, key string) (artifactcache.Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.getCalls++
 	entry, ok := s.entries[key]
 	if !ok {
@@ -707,6 +868,8 @@ func (s *memoryArtifactStore) Get(_ context.Context, key string) (artifactcache.
 }
 
 func (s *memoryArtifactStore) Put(_ context.Context, key string, req artifactcache.PutRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.putCalls++
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
@@ -790,11 +953,14 @@ type bypassMetricKey struct {
 }
 
 type testCacheMetrics struct {
+	mu          sync.Mutex
 	hits        map[string]int
 	misses      map[string]int
 	storeErrors map[string]int
 	readErrors  map[string]int
 	bypasses    map[bypassMetricKey]int
+	fillLeaders map[string]int
+	fillWaiters map[fillWaiterMetricKey]int
 }
 
 func newTestCacheMetrics() *testCacheMetrics {
@@ -804,13 +970,158 @@ func newTestCacheMetrics() *testCacheMetrics {
 		storeErrors: make(map[string]int),
 		readErrors:  make(map[string]int),
 		bypasses:    make(map[bypassMetricKey]int),
+		fillLeaders: make(map[string]int),
+		fillWaiters: make(map[fillWaiterMetricKey]int),
 	}
 }
 
-func (m *testCacheMetrics) Hit(route string)        { m.hits[route]++ }
-func (m *testCacheMetrics) Miss(route string)       { m.misses[route]++ }
-func (m *testCacheMetrics) StoreError(route string) { m.storeErrors[route]++ }
-func (m *testCacheMetrics) ReadError(route string)  { m.readErrors[route]++ }
+func (m *testCacheMetrics) Hit(route string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hits[route]++
+}
+func (m *testCacheMetrics) Miss(route string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.misses[route]++
+}
+func (m *testCacheMetrics) StoreError(route string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.storeErrors[route]++
+}
+func (m *testCacheMetrics) ReadError(route string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.readErrors[route]++
+}
 func (m *testCacheMetrics) Bypass(route, reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.bypasses[bypassMetricKey{route: route, reason: reason}]++
+}
+
+type fillWaiterMetricKey struct {
+	route string
+	scope string
+}
+
+func (m *testCacheMetrics) CacheFillLeader(route string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fillLeaders[route]++
+}
+
+func (m *testCacheMetrics) CacheFillWaiter(route, scope string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fillWaiters[fillWaiterMetricKey{route: route, scope: scope}]++
+}
+
+func (m *testCacheMetrics) fillLeaderCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fillLeaders["npm"]
+}
+
+func (m *testCacheMetrics) fillWaiterCount(scope string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fillWaiters[fillWaiterMetricKey{route: "npm", scope: scope}]
+}
+
+func waitForMetric(t *testing.T, timeout time.Duration, ready func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !ready() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for metric")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type memoryCoordinator struct {
+	mu        sync.Mutex
+	resources map[string]string
+	nextOwner int
+	cooldowns map[string]time.Time
+}
+
+func newMemoryCoordinator() *memoryCoordinator {
+	return &memoryCoordinator{resources: make(map[string]string), cooldowns: make(map[string]time.Time)}
+}
+
+func (c *memoryCoordinator) TryAcquire(_ context.Context, resource string, _ time.Duration) (coordination.Lease, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.resources[resource]; ok {
+		return nil, false, nil
+	}
+	c.nextOwner++
+	owner := strconv.Itoa(c.nextOwner)
+	c.resources[resource] = owner
+	return &memoryLease{coordinator: c, resource: resource, owner: owner}, true, nil
+}
+
+func (c *memoryCoordinator) Cooldown(_ context.Context, route string) (time.Time, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cooldowns[route], nil
+}
+
+func (c *memoryCoordinator) SetCooldown(_ context.Context, route string, until time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if until.After(c.cooldowns[route]) {
+		c.cooldowns[route] = until
+	}
+	return nil
+}
+
+type memoryLease struct {
+	coordinator *memoryCoordinator
+	resource    string
+	owner       string
+}
+
+func (*memoryLease) Renew(context.Context, time.Duration) error { return nil }
+
+func (l *memoryLease) Release(context.Context) error {
+	l.coordinator.mu.Lock()
+	defer l.coordinator.mu.Unlock()
+	if l.coordinator.resources[l.resource] != l.owner {
+		return coordination.ErrLeaseLost
+	}
+	delete(l.coordinator.resources, l.resource)
+	return nil
+}
+
+type fixedLeaseCoordinator struct {
+	lease coordination.Lease
+}
+
+func (c *fixedLeaseCoordinator) TryAcquire(context.Context, string, time.Duration) (coordination.Lease, bool, error) {
+	return c.lease, true, nil
+}
+
+func (*fixedLeaseCoordinator) Cooldown(context.Context, string) (time.Time, error) {
+	return time.Time{}, nil
+}
+
+func (*fixedLeaseCoordinator) SetCooldown(context.Context, string, time.Time) error {
+	return nil
+}
+
+type failingRenewLease struct {
+	released atomic.Bool
+}
+
+func (*failingRenewLease) Renew(context.Context, time.Duration) error {
+	return errors.New("coordination unavailable")
+}
+
+func (l *failingRenewLease) Release(context.Context) error {
+	l.released.Store(true)
+	return nil
 }

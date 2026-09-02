@@ -178,6 +178,13 @@ func TestServerReturnsGatewayTimeoutForUpstreamHeaderDeadline(t *testing.T) {
 	assertGatewayError(t, recorder, http.StatusGatewayTimeout, "upstream_timeout")
 }
 
+func TestUpstreamQueueTimeoutMapsToServiceUnavailable(t *testing.T) {
+	status, code, message := upstreamErrorResponse(proxy.ErrUpstreamQueueTimeout)
+	if status != http.StatusServiceUnavailable || code != "upstream_busy" || message != "upstream request queue is full" {
+		t.Fatalf("mapping = (%d, %q, %q)", status, code, message)
+	}
+}
+
 func TestServerDoesNotOverwriteStartedUpstreamResponse(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.PublicBaseURL = "http://firewall.test"

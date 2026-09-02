@@ -17,14 +17,15 @@ import (
 const maxS3PutObjectSize = int64(5_000_000_000)
 
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Upstream UpstreamConfig `yaml:"upstream"`
-	Auth     AuthConfig     `yaml:"auth"`
-	Cache    CacheConfig    `yaml:"cache"`
-	Decision DecisionConfig `yaml:"decision"`
-	Intel    IntelConfig    `yaml:"intel"`
-	Policy   PolicyConfig   `yaml:"policy"`
-	Routes   []RouteConfig  `yaml:"routes"`
+	Server       ServerConfig       `yaml:"server"`
+	Upstream     UpstreamConfig     `yaml:"upstream"`
+	Auth         AuthConfig         `yaml:"auth"`
+	Cache        CacheConfig        `yaml:"cache"`
+	Coordination CoordinationConfig `yaml:"coordination"`
+	Decision     DecisionConfig     `yaml:"decision"`
+	Intel        IntelConfig        `yaml:"intel"`
+	Policy       PolicyConfig       `yaml:"policy"`
+	Routes       []RouteConfig      `yaml:"routes"`
 }
 
 type ServerConfig struct {
@@ -36,8 +37,12 @@ type ServerConfig struct {
 }
 
 type UpstreamConfig struct {
-	RequestTimeout        Duration `yaml:"request_timeout"`
-	ResponseHeaderTimeout Duration `yaml:"response_header_timeout"`
+	RequestTimeout           Duration `yaml:"request_timeout"`
+	ResponseHeaderTimeout    Duration `yaml:"response_header_timeout"`
+	MaxConcurrentPerRegistry int      `yaml:"max_concurrent_per_registry"`
+	QueueTimeout             Duration `yaml:"queue_timeout"`
+	RateLimitRetries         int      `yaml:"rate_limit_retries"`
+	MaxRetryAfter            Duration `yaml:"max_retry_after"`
 }
 
 type AuthConfig struct {
@@ -65,6 +70,18 @@ type S3CacheConfig struct {
 	Bucket              string `yaml:"bucket"`
 	Prefix              string `yaml:"prefix"`
 	ExpectedBucketOwner string `yaml:"expected_bucket_owner"`
+}
+
+type CoordinationConfig struct {
+	Backend       string                     `yaml:"backend"`
+	LeaseDuration Duration                   `yaml:"lease_duration"`
+	PollInterval  Duration                   `yaml:"poll_interval"`
+	DynamoDB      DynamoDBCoordinationConfig `yaml:"dynamodb"`
+}
+
+type DynamoDBCoordinationConfig struct {
+	Table     string `yaml:"table"`
+	KeyPrefix string `yaml:"key_prefix"`
 }
 
 type DecisionConfig struct {
@@ -110,8 +127,12 @@ func Default() Config {
 			PublicBaseURL:   "http://localhost:8080",
 		},
 		Upstream: UpstreamConfig{
-			RequestTimeout:        Duration(9 * time.Minute),
-			ResponseHeaderTimeout: Duration(30 * time.Second),
+			RequestTimeout:           Duration(9 * time.Minute),
+			ResponseHeaderTimeout:    Duration(30 * time.Second),
+			MaxConcurrentPerRegistry: 4,
+			QueueTimeout:             Duration(15 * time.Second),
+			RateLimitRetries:         1,
+			MaxRetryAfter:            Duration(30 * time.Second),
 		},
 		Cache: CacheConfig{
 			Backend:       "none",
@@ -119,6 +140,14 @@ func Default() Config {
 			MaxObjectSize: 512 << 20,
 			ReadTimeout:   Duration(30 * time.Second),
 			StoreTimeout:  Duration(10 * time.Minute),
+		},
+		Coordination: CoordinationConfig{
+			Backend:       "none",
+			LeaseDuration: Duration(30 * time.Second),
+			PollInterval:  Duration(time.Second),
+			DynamoDB: DynamoDBCoordinationConfig{
+				KeyPrefix: "package-firewall",
+			},
 		},
 		Decision: DecisionConfig{
 			FailOpenIntelErrors:         true,
@@ -192,6 +221,34 @@ func applyEnv(cfg *Config) error {
 		}
 		cfg.Upstream.ResponseHeaderTimeout = Duration(parsed)
 	}
+	if v := os.Getenv("PFW_UPSTREAM_MAX_CONCURRENT_PER_REGISTRY"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("PFW_UPSTREAM_MAX_CONCURRENT_PER_REGISTRY is invalid: %w", err)
+		}
+		cfg.Upstream.MaxConcurrentPerRegistry = parsed
+	}
+	if v := os.Getenv("PFW_UPSTREAM_QUEUE_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_UPSTREAM_QUEUE_TIMEOUT is invalid: %w", err)
+		}
+		cfg.Upstream.QueueTimeout = Duration(parsed)
+	}
+	if v := os.Getenv("PFW_UPSTREAM_RATE_LIMIT_RETRIES"); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("PFW_UPSTREAM_RATE_LIMIT_RETRIES is invalid: %w", err)
+		}
+		cfg.Upstream.RateLimitRetries = parsed
+	}
+	if v := os.Getenv("PFW_UPSTREAM_MAX_RETRY_AFTER"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_UPSTREAM_MAX_RETRY_AFTER is invalid: %w", err)
+		}
+		cfg.Upstream.MaxRetryAfter = Duration(parsed)
+	}
 	if v := os.Getenv("PFW_FAIL_OPEN_INTEL_ERRORS"); v != "" {
 		cfg.Decision.FailOpenIntelErrors = parseBool(v, cfg.Decision.FailOpenIntelErrors)
 	}
@@ -250,6 +307,29 @@ func applyEnv(cfg *Config) error {
 	if v := os.Getenv("PFW_CACHE_S3_EXPECTED_BUCKET_OWNER"); v != "" {
 		cfg.Cache.S3.ExpectedBucketOwner = v
 	}
+	if v := os.Getenv("PFW_COORDINATION_BACKEND"); v != "" {
+		cfg.Coordination.Backend = v
+	}
+	if v := os.Getenv("PFW_COORDINATION_LEASE_DURATION"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_COORDINATION_LEASE_DURATION is invalid: %w", err)
+		}
+		cfg.Coordination.LeaseDuration = Duration(parsed)
+	}
+	if v := os.Getenv("PFW_COORDINATION_POLL_INTERVAL"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("PFW_COORDINATION_POLL_INTERVAL is invalid: %w", err)
+		}
+		cfg.Coordination.PollInterval = Duration(parsed)
+	}
+	if v := os.Getenv("PFW_COORDINATION_DYNAMODB_TABLE"); v != "" {
+		cfg.Coordination.DynamoDB.Table = v
+	}
+	if v := os.Getenv("PFW_COORDINATION_DYNAMODB_KEY_PREFIX"); v != "" {
+		cfg.Coordination.DynamoDB.KeyPrefix = v
+	}
 	return nil
 }
 
@@ -277,6 +357,18 @@ func (cfg Config) Validate() error {
 	} else if cfg.Upstream.RequestTimeout > 0 && cfg.Upstream.ResponseHeaderTimeout > cfg.Upstream.RequestTimeout {
 		errs = append(errs, errors.New("upstream.response_header_timeout cannot exceed upstream.request_timeout"))
 	}
+	if cfg.Upstream.MaxConcurrentPerRegistry <= 0 {
+		errs = append(errs, errors.New("upstream.max_concurrent_per_registry must be positive"))
+	}
+	if cfg.Upstream.QueueTimeout <= 0 {
+		errs = append(errs, errors.New("upstream.queue_timeout must be positive"))
+	}
+	if cfg.Upstream.RateLimitRetries < 0 || cfg.Upstream.RateLimitRetries > 3 {
+		errs = append(errs, errors.New("upstream.rate_limit_retries must be between 0 and 3"))
+	}
+	if cfg.Upstream.MaxRetryAfter <= 0 {
+		errs = append(errs, errors.New("upstream.max_retry_after must be positive"))
+	}
 	if _, err := url.ParseRequestURI(cfg.Server.PublicBaseURL); err != nil {
 		errs = append(errs, fmt.Errorf("server.public_base_url is invalid: %w", err))
 	}
@@ -300,6 +392,29 @@ func (cfg Config) Validate() error {
 		}
 	default:
 		errs = append(errs, fmt.Errorf("cache.backend %q is unsupported", cfg.Cache.Backend))
+	}
+	switch cfg.Coordination.Backend {
+	case "", "none":
+	case "dynamodb":
+		if cfg.Cache.Backend == "filesystem" {
+			errs = append(errs, errors.New("coordination.backend=dynamodb cannot be used with a replica-local filesystem cache"))
+		}
+		if strings.TrimSpace(cfg.Coordination.DynamoDB.Table) == "" {
+			errs = append(errs, errors.New("coordination.dynamodb.table is required when coordination.backend=dynamodb"))
+		}
+		if strings.Trim(strings.TrimSpace(cfg.Coordination.DynamoDB.KeyPrefix), "#") == "" {
+			errs = append(errs, errors.New("coordination.dynamodb.key_prefix must not be empty"))
+		}
+		if cfg.Coordination.LeaseDuration < Duration(3*time.Second) {
+			errs = append(errs, errors.New("coordination.lease_duration must be at least 3s"))
+		}
+		if cfg.Coordination.PollInterval <= 0 {
+			errs = append(errs, errors.New("coordination.poll_interval must be positive"))
+		} else if cfg.Coordination.LeaseDuration > 0 && cfg.Coordination.PollInterval >= cfg.Coordination.LeaseDuration {
+			errs = append(errs, errors.New("coordination.poll_interval must be shorter than coordination.lease_duration"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("coordination.backend %q is unsupported", cfg.Coordination.Backend))
 	}
 	if cfg.Decision.DefaultVulnerabilityAction != "warn" && cfg.Decision.DefaultVulnerabilityAction != "block" && cfg.Decision.DefaultVulnerabilityAction != "monitor" {
 		errs = append(errs, errors.New("decision.default_vulnerability_action must be warn, block, or monitor"))

@@ -83,6 +83,35 @@ go run ./cmd/pfw identify --ecosystem go --prefix /go/ --path /go/golang.org/x/m
 go run ./cmd/pfw decide --ecosystem npm --name lodash --version 4.17.21
 ```
 
+### Gradle cache prewarming
+
+`pfw prewarm` discovers committed `gradle.lockfile` files, intersects them with
+`gradle/verification-metadata.xml`, and downloads the resulting exact Maven
+artifacts through Package Firewall with a default concurrency of two. It skips
+source and Javadoc archives, validates every response against the committed
+SHA-256 values, runs two complete passes, and fails unless every artifact is a
+cache `HIT` on the second pass.
+
+Check the manifest without making network requests:
+
+```bash
+go run ./cmd/pfw prewarm --check --root ../backend
+```
+
+Warm a deployed firewall without putting a credential on the command line:
+
+```bash
+export PFW_BASE_URL=https://packages.example.com
+export PACKAGE_FIREWALL_TOKEN=replace-me
+go run ./cmd/pfw prewarm \
+  --root ../backend \
+  --bearer-token-env PACKAGE_FIREWALL_TOKEN
+```
+
+Use this as one controlled job before a CI traffic wave. A non-`HIT` second
+pass is a failed rollout gate: it indicates disabled/failed cache storage,
+insufficient cache-write settling, or an artifact path that bypasses caching.
+
 ## Docker
 
 ```bash
@@ -122,12 +151,18 @@ Important settings:
 
 - `upstream.request_timeout`: total upstream request lifetime, including redirects and the complete response body; the server write timeout must also leave room for enabled intelligence and cache reads.
 - `upstream.response_header_timeout`: maximum wait for upstream response headers.
+- `upstream.max_concurrent_per_registry`: maximum in-flight upstream responses per registry origin on each replica.
+- `upstream.queue_timeout`: maximum time a request may wait for a per-registry concurrency slot.
+- `upstream.rate_limit_retries`: bounded retry count for bodyless `GET` and `HEAD` requests that receive `429`.
+- `upstream.max_retry_after`: maximum cooldown a request waits inline; longer cooldowns are returned to the caller while remaining shared across replicas.
 - `cache.backend`: `none`, `filesystem`, or `s3`.
 - `cache.artifact_ttl`: freshness lifetime stored with each cached artifact.
 - `cache.max_object_size`: maximum artifact bytes ever written to temporary cache storage.
 - `cache.temp_directory`: staging directory for bounded fills and integrity-checked hits; the operating system temp directory is used when empty.
 - `cache.read_timeout`: maximum time spent loading and integrity-checking a cache hit before falling back to upstream.
 - `cache.store_timeout`: maximum lifetime of a background cache store after the client response completes.
+- `coordination.backend`: `none` or `dynamodb`; use DynamoDB with a shared S3 cache to coalesce cold misses and share upstream cooldowns across replicas.
+- `coordination.lease_duration` and `coordination.poll_interval`: bound distributed artifact-fill ownership and waiter polling.
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
@@ -135,13 +170,18 @@ Important settings:
 - `routes[].allowed_redirect_origins`: exact additional HTTP(S) origins accepted when redirect-origin enforcement is enabled.
 - `auth.bearer_token_env` and `auth.basic_*_env`: require clients to authenticate to the firewall.
 
-Upstream timeouts can be supplied with `PFW_UPSTREAM_REQUEST_TIMEOUT` and
-`PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT`. Cache settings can be supplied with `PFW_CACHE_BACKEND`,
+Upstream settings can be supplied with `PFW_UPSTREAM_REQUEST_TIMEOUT`,
+`PFW_UPSTREAM_RESPONSE_HEADER_TIMEOUT`,
+`PFW_UPSTREAM_MAX_CONCURRENT_PER_REGISTRY`, `PFW_UPSTREAM_QUEUE_TIMEOUT`,
+`PFW_UPSTREAM_RATE_LIMIT_RETRIES`, and `PFW_UPSTREAM_MAX_RETRY_AFTER`. Cache settings can be supplied with `PFW_CACHE_BACKEND`,
 `PFW_CACHE_ARTIFACT_TTL`, `PFW_CACHE_MAX_OBJECT_SIZE`,
 `PFW_CACHE_TEMP_DIRECTORY`, `PFW_CACHE_READ_TIMEOUT`,
 `PFW_CACHE_STORE_TIMEOUT`, `PFW_CACHE_FILESYSTEM_DIRECTORY`,
 `PFW_CACHE_S3_BUCKET`, `PFW_CACHE_S3_PREFIX`, and
-`PFW_CACHE_S3_EXPECTED_BUCKET_OWNER`.
+`PFW_CACHE_S3_EXPECTED_BUCKET_OWNER`. Coordination settings can be supplied
+with `PFW_COORDINATION_BACKEND`, `PFW_COORDINATION_LEASE_DURATION`,
+`PFW_COORDINATION_POLL_INTERVAL`, `PFW_COORDINATION_DYNAMODB_TABLE`, and
+`PFW_COORDINATION_DYNAMODB_KEY_PREFIX`.
 
 Cross-origin redirects are followed by default and logged as
 `upstream_cross_origin_redirect` with normalized origin-only fields. Redirects
@@ -156,6 +196,7 @@ The artifact cache is deliberately narrower than a general HTTP cache:
 - Only exact package artifacts identified with a concrete name, version, and PURL are eligible. Requests must be bodyless `GET`s with no query, `Range`, conditional headers, cache-revalidation directives, cookies, or representation-selecting headers.
 - Only upstream status `200` responses are stored. Redirected, ranged, encoded, `Vary`, `Set-Cookie`, `private`, `no-cache`, and `no-store` responses bypass storage.
 - A miss streams the complete upstream response to the client independently of a bounded temp-file capture. The capture stops at `cache.max_object_size`; bounded backend stores continue in the background and cannot delay response completion.
+- Concurrent misses for one artifact are coalesced in-process. With DynamoDB coordination enabled, one lease holder downloads and stores the artifact while other replicas poll the shared cache.
 - A hit is downloaded to bounded temp storage and checked against its recorded byte count and SHA-256 before response headers or body bytes are sent. A missing, truncated, corrupt, or unreadable entry becomes an ordinary miss.
 - Cache reads are bounded by `cache.read_timeout`; a slow cache becomes a clean miss instead of delaying the upstream fallback indefinitely.
 
@@ -167,6 +208,12 @@ The `/metrics` endpoint exports:
 - `package_firewall_cache_store_errors_total`
 - `package_firewall_cache_read_errors_total`
 - `package_firewall_cache_bypasses_total{reason="..."}`
+- `package_firewall_cache_fill_leaders_total`
+- `package_firewall_cache_fill_waiters_total{scope="process|cluster"}`
+- `package_firewall_upstream_requests_total{status="..."}`
+- `package_firewall_upstream_in_flight`
+- `package_firewall_upstream_retries_total{reason="rate_limited"}`
+- `package_firewall_upstream_throttled_total{reason="..."}`
 
 Bypass reasons are bounded values such as `cache_disabled`, `method`,
 `not_exact_artifact`, `query`, `range`, `conditional`, `representation`,
@@ -174,9 +221,11 @@ Bypass reasons are bounded values such as `cache_disabled`, `method`,
 
 ## AWS S3 Cache
 
-S3 is the recommended backend for multiple replicas in AWS. It needs no
-DynamoDB table: expiry, safe response headers, byte length, and SHA-256 are
-stored with each S3 object. Example:
+S3 is the recommended artifact backend for multiple replicas in AWS. The
+artifact objects themselves need no DynamoDB metadata: expiry, safe response
+headers, byte length, and SHA-256 are stored with each S3 object. Enable the
+separate DynamoDB coordinator for highly available replicas so a cold artifact
+causes one upstream download rather than one per pod. Example:
 
 ```yaml
 cache:
@@ -190,6 +239,13 @@ cache:
     bucket: company-package-firewall-cache
     prefix: artifacts
     expected_bucket_owner: "123456789012"
+coordination:
+  backend: dynamodb
+  lease_duration: 30s
+  poll_interval: 1s
+  dynamodb:
+    table: company-package-firewall-coordination
+    key_prefix: production
 ```
 
 The process uses the AWS SDK default credential chain. Set `AWS_REGION` to the
@@ -237,6 +293,28 @@ bucket. See the module documentation and the
 [create-new](deploy/opentofu/examples/s3-cache-create) and
 [existing-bucket](deploy/opentofu/examples/s3-cache-existing) examples before
 applying it.
+
+The reusable
+[OpenTofu DynamoDB coordination module](deploy/opentofu/modules/dynamodb-coordination)
+creates an on-demand, encrypted table with the required
+`coordination_key` string partition key and `expires_at` TTL. Its environment
+output and least-privilege IAM policy cover `GetItem`, `UpdateItem`, and
+`DeleteItem` only:
+
+```hcl
+module "package_firewall_coordination" {
+  source = "git::https://github.com/travisjeffery/package-firewall.git//deploy/opentofu/modules/dynamodb-coordination?ref=vX.Y.Z"
+
+  table_name = "company-package-firewall-coordination"
+  key_prefix = "production"
+}
+```
+
+DynamoDB coordination is off the artifact-hit path. A warm S3 cache remains
+available if DynamoDB is impaired; cold misses fail closed rather than starting
+uncoordinated duplicate downloads. DynamoDB TTL cleanup is asynchronous, so
+lease and cooldown acquisition conditions also treat expired records as
+immediately reusable.
 
 The service treats lifecycle-expired objects as misses but does not delete them
 itself. Prefer a same-region bucket and an S3 gateway endpoint for private,

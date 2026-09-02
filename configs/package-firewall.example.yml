@@ -6,8 +6,12 @@ server:
   public_base_url: "http://localhost:8080"
 
 upstream:
-  request_timeout: 9m # includes redirects and reading the complete response body
+  request_timeout: 9m # includes queueing, retries, redirects, and the complete response body
   response_header_timeout: 30s
+  max_concurrent_per_registry: 4
+  queue_timeout: 15s
+  rate_limit_retries: 1
+  max_retry_after: 30s
 
 auth:
   bearer_token_env: ""
@@ -27,6 +31,14 @@ cache:
     bucket: ""
     prefix: package-firewall
     expected_bucket_owner: ""
+
+coordination:
+  backend: none # none or dynamodb; use dynamodb with a shared S3 cache across replicas
+  lease_duration: 30s
+  poll_interval: 1s
+  dynamodb:
+    table: ""
+    key_prefix: package-firewall
 
 decision:
   fail_open_intel_errors: true

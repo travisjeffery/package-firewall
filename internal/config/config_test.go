@@ -43,11 +43,100 @@ policy:
 	if cfg.Upstream.RequestTimeout.Std() != 9*time.Minute || cfg.Upstream.ResponseHeaderTimeout.Std() != 30*time.Second {
 		t.Fatalf("upstream timeouts = request %s response headers %s", cfg.Upstream.RequestTimeout.Std(), cfg.Upstream.ResponseHeaderTimeout.Std())
 	}
+	if cfg.Upstream.MaxConcurrentPerRegistry != 4 || cfg.Upstream.QueueTimeout.Std() != 15*time.Second || cfg.Upstream.RateLimitRetries != 1 || cfg.Upstream.MaxRetryAfter.Std() != 30*time.Second {
+		t.Fatalf("upstream protection defaults = %#v", cfg.Upstream)
+	}
 	if cfg.Cache.ReadTimeout.Std() != 30*time.Second || cfg.Cache.StoreTimeout.Std() != 10*time.Minute {
 		t.Fatalf("cache timeouts = read %s store %s", cfg.Cache.ReadTimeout.Std(), cfg.Cache.StoreTimeout.Std())
 	}
+	if cfg.Coordination.Backend != "none" || cfg.Coordination.LeaseDuration.Std() != 30*time.Second || cfg.Coordination.PollInterval.Std() != time.Second {
+		t.Fatalf("coordination defaults = %#v", cfg.Coordination)
+	}
 	if cfg.Policy.Files[0] != filepath.Join(dir, "policy.yml") {
 		t.Fatalf("policy path = %q", cfg.Policy.Files[0])
+	}
+}
+
+func TestValidateCoordination(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		wantError string
+	}{
+		{name: "dynamodb", configure: func(cfg *Config) {
+			cfg.Coordination.Backend = "dynamodb"
+			cfg.Coordination.DynamoDB.Table = "package-firewall"
+		}},
+		{name: "table required", configure: func(cfg *Config) {
+			cfg.Coordination.Backend = "dynamodb"
+		}, wantError: "coordination.dynamodb.table"},
+		{name: "lease bounded", configure: func(cfg *Config) {
+			cfg.Coordination.Backend = "dynamodb"
+			cfg.Coordination.DynamoDB.Table = "package-firewall"
+			cfg.Coordination.LeaseDuration = Duration(2 * time.Second)
+		}, wantError: "lease_duration"},
+		{name: "poll shorter than lease", configure: func(cfg *Config) {
+			cfg.Coordination.Backend = "dynamodb"
+			cfg.Coordination.DynamoDB.Table = "package-firewall"
+			cfg.Coordination.PollInterval = cfg.Coordination.LeaseDuration
+		}, wantError: "poll_interval"},
+		{name: "unsupported", configure: func(cfg *Config) {
+			cfg.Coordination.Backend = "redis"
+		}, wantError: "unsupported"},
+		{name: "filesystem cache is not shared", configure: func(cfg *Config) {
+			cfg.Cache.Backend = "filesystem"
+			cfg.Cache.Filesystem.Directory = "/cache"
+			cfg.Coordination.Backend = "dynamodb"
+			cfg.Coordination.DynamoDB.Table = "package-firewall"
+		}, wantError: "replica-local filesystem cache"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			test.configure(&cfg)
+			err := cfg.Validate()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("error = %v want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestLoadAppliesCoordinationEnvironmentOverrides(t *testing.T) {
+	t.Setenv("PFW_COORDINATION_BACKEND", "dynamodb")
+	t.Setenv("PFW_COORDINATION_LEASE_DURATION", "45s")
+	t.Setenv("PFW_COORDINATION_POLL_INTERVAL", "2s")
+	t.Setenv("PFW_COORDINATION_DYNAMODB_TABLE", "coordination")
+	t.Setenv("PFW_COORDINATION_DYNAMODB_KEY_PREFIX", "ci")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Coordination.Backend != "dynamodb" || cfg.Coordination.LeaseDuration.Std() != 45*time.Second || cfg.Coordination.PollInterval.Std() != 2*time.Second {
+		t.Fatalf("coordination config = %#v", cfg.Coordination)
+	}
+	if cfg.Coordination.DynamoDB.Table != "coordination" || cfg.Coordination.DynamoDB.KeyPrefix != "ci" {
+		t.Fatalf("DynamoDB coordination config = %#v", cfg.Coordination.DynamoDB)
+	}
+}
+
+func TestLoadAppliesUpstreamProtectionEnvironmentOverrides(t *testing.T) {
+	t.Setenv("PFW_UPSTREAM_MAX_CONCURRENT_PER_REGISTRY", "7")
+	t.Setenv("PFW_UPSTREAM_QUEUE_TIMEOUT", "12s")
+	t.Setenv("PFW_UPSTREAM_RATE_LIMIT_RETRIES", "2")
+	t.Setenv("PFW_UPSTREAM_MAX_RETRY_AFTER", "45s")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Upstream.MaxConcurrentPerRegistry != 7 || cfg.Upstream.QueueTimeout.Std() != 12*time.Second || cfg.Upstream.RateLimitRetries != 2 || cfg.Upstream.MaxRetryAfter.Std() != 45*time.Second {
+		t.Fatalf("upstream protection config = %#v", cfg.Upstream)
 	}
 }
 
@@ -87,6 +176,18 @@ func TestValidateUpstreamTimeouts(t *testing.T) {
 			cfg.Upstream.RequestTimeout = Duration(time.Minute)
 			cfg.Upstream.ResponseHeaderTimeout = Duration(2 * time.Minute)
 		}, want: "upstream.response_header_timeout cannot exceed upstream.request_timeout"},
+		{name: "registry concurrency required", configure: func(cfg *Config) {
+			cfg.Upstream.MaxConcurrentPerRegistry = 0
+		}, want: "upstream.max_concurrent_per_registry must be positive"},
+		{name: "queue timeout required", configure: func(cfg *Config) {
+			cfg.Upstream.QueueTimeout = 0
+		}, want: "upstream.queue_timeout must be positive"},
+		{name: "retry count bounded", configure: func(cfg *Config) {
+			cfg.Upstream.RateLimitRetries = 4
+		}, want: "upstream.rate_limit_retries must be between 0 and 3"},
+		{name: "retry-after bound required", configure: func(cfg *Config) {
+			cfg.Upstream.MaxRetryAfter = 0
+		}, want: "upstream.max_retry_after must be positive"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

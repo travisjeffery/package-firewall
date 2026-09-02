@@ -36,11 +36,13 @@ func TestPolicyAndIntelRunBeforeEveryCacheHit(t *testing.T) {
 		testCacheServerConfig(upstream.URL),
 		engine,
 		provider,
-		proxy.CacheConfig{
-			Store:         store,
-			ArtifactTTL:   time.Hour,
-			MaxObjectSize: 1024,
-			TempDirectory: t.TempDir(),
+		RuntimeConfig{
+			Cache: proxy.CacheConfig{
+				Store:         store,
+				ArtifactTTL:   time.Hour,
+				MaxObjectSize: 1024,
+				TempDirectory: t.TempDir(),
+			},
 		},
 	).routesHandler()
 
@@ -92,11 +94,13 @@ func TestBlockingPolicyRunsBeforeCacheLookup(t *testing.T) {
 		testCacheServerConfig(upstream.URL),
 		engine,
 		provider,
-		proxy.CacheConfig{
-			Store:         store,
-			ArtifactTTL:   time.Hour,
-			MaxObjectSize: 1024,
-			TempDirectory: t.TempDir(),
+		RuntimeConfig{
+			Cache: proxy.CacheConfig{
+				Store:         store,
+				ArtifactTTL:   time.Hour,
+				MaxObjectSize: 1024,
+				TempDirectory: t.TempDir(),
+			},
 		},
 	).routesHandler()
 	recorder := httptest.NewRecorder()

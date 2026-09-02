@@ -9,10 +9,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/travisjeffery/package-firewall/internal/artifactcache"
 	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/package-firewall/internal/coordination"
 	"github.com/travisjeffery/package-firewall/internal/intel"
 	"github.com/travisjeffery/package-firewall/internal/policy"
 	"github.com/travisjeffery/package-firewall/internal/proxy"
@@ -47,11 +50,11 @@ func run(args []string) error {
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		cacheConfig, err := cacheFromConfig(ctx, cfg)
+		runtimeConfig, err := runtimeFromConfig(ctx, cfg)
 		if err != nil {
 			return err
 		}
-		return server.Run(ctx, cfg, policyEngine, providerFromConfig(cfg), cacheConfig)
+		return server.Run(ctx, cfg, policyEngine, providerFromConfig(cfg), runtimeConfig)
 	case "version":
 		fmt.Println("package-firewall dev")
 		return nil
@@ -74,33 +77,46 @@ func providerFromConfig(cfg config.Config) intel.Provider {
 	return intel.NewOSVProvider(cfg.Intel.OSV.APIURL, cfg.Intel.OSV.Timeout.Std(), cfg.Intel.OSV.CacheTTL.Std())
 }
 
-func cacheFromConfig(ctx context.Context, cfg config.Config) (proxy.CacheConfig, error) {
-	cacheConfig := proxy.CacheConfig{
+func runtimeFromConfig(ctx context.Context, cfg config.Config) (server.RuntimeConfig, error) {
+	runtimeConfig := server.RuntimeConfig{Cache: proxy.CacheConfig{
 		ArtifactTTL:   cfg.Cache.ArtifactTTL.Std(),
 		MaxObjectSize: cfg.Cache.MaxObjectSize,
 		TempDirectory: cfg.Cache.TempDirectory,
 		ReadTimeout:   cfg.Cache.ReadTimeout.Std(),
 		StoreTimeout:  cfg.Cache.StoreTimeout.Std(),
+	}}
+	var awsConfig aws.Config
+	if cfg.Cache.Backend == "s3" || cfg.Coordination.Backend == "dynamodb" {
+		loaded, err := awsconfig.LoadDefaultConfig(ctx)
+		if err != nil {
+			return server.RuntimeConfig{}, fmt.Errorf("load AWS configuration: %w", err)
+		}
+		awsConfig = loaded
 	}
 	switch cfg.Cache.Backend {
 	case "", "none":
-		return cacheConfig, nil
 	case "filesystem":
-		cacheConfig.Store = artifactcache.NewFileSystemStore(cfg.Cache.Filesystem.Directory)
-		return cacheConfig, nil
+		runtimeConfig.Cache.Store = artifactcache.NewFileSystemStore(cfg.Cache.Filesystem.Directory)
 	case "s3":
-		awsConfig, err := awsconfig.LoadDefaultConfig(ctx)
-		if err != nil {
-			return proxy.CacheConfig{}, fmt.Errorf("load AWS configuration for artifact cache: %w", err)
-		}
-		cacheConfig.Store = artifactcache.NewS3Store(artifactcache.S3Config{
+		runtimeConfig.Cache.Store = artifactcache.NewS3Store(artifactcache.S3Config{
 			Client:              s3.NewFromConfig(awsConfig),
 			Bucket:              cfg.Cache.S3.Bucket,
 			Prefix:              cfg.Cache.S3.Prefix,
 			ExpectedBucketOwner: cfg.Cache.S3.ExpectedBucketOwner,
 		})
-		return cacheConfig, nil
 	default:
-		return proxy.CacheConfig{}, fmt.Errorf("unsupported cache backend %q", cfg.Cache.Backend)
+		return server.RuntimeConfig{}, fmt.Errorf("unsupported cache backend %q", cfg.Cache.Backend)
 	}
+	if cfg.Coordination.Backend == "dynamodb" {
+		coordinator, err := coordination.NewDynamoDB(coordination.DynamoDBConfig{
+			Client:    dynamodb.NewFromConfig(awsConfig),
+			Table:     cfg.Coordination.DynamoDB.Table,
+			KeyPrefix: cfg.Coordination.DynamoDB.KeyPrefix,
+		})
+		if err != nil {
+			return server.RuntimeConfig{}, err
+		}
+		runtimeConfig.Coordinator = coordinator
+	}
+	return runtimeConfig, nil
 }

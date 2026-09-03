@@ -321,11 +321,10 @@ func (p *Proxy) cacheKey(r *http.Request, route config.RouteConfig, info registr
 	if r.Body != nil && r.Body != http.NoBody {
 		return "", "request_body"
 	}
-	representation, cacheable := cacheRepresentation(r.Header)
-	if !cacheable {
+	if !cacheableRequestRepresentation(r.Header) {
 		return "", "representation"
 	}
-	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target, "representation-v1", representation, "identity"), ""
+	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target, "representation-v2", "identity"), ""
 }
 
 func (p *Proxy) responseBypassReason(resp *http.Response, target string) string {
@@ -706,16 +705,13 @@ func hasCacheDirective(values []string, directives ...string) bool {
 	return false
 }
 
-func cacheRepresentation(headers http.Header) (string, bool) {
+func cacheableRequestRepresentation(headers http.Header) bool {
 	for _, name := range []string{"Accept-Charset", "Accept-Language", "A-IM", "Cookie", "Origin", "Prefer", "Want-Digest"} {
 		if headers.Get(name) != "" {
-			return "", false
+			return false
 		}
 	}
-	if !identityEncodingAccepted(headers.Values("Accept-Encoding")) {
-		return "", false
-	}
-	return strings.TrimSpace(strings.Join(headers.Values("Accept"), ",")), true
+	return identityEncodingAccepted(headers.Values("Accept-Encoding"))
 }
 
 func identityEncodingAccepted(values []string) bool {
@@ -793,7 +789,7 @@ func cacheableResponseVary(headers http.Header) bool {
 	for _, value := range headers.Values("Vary") {
 		for _, name := range strings.Split(value, ",") {
 			switch strings.ToLower(strings.TrimSpace(name)) {
-			case "", "accept", "accept-encoding":
+			case "", "accept-encoding":
 			default:
 				return false
 			}

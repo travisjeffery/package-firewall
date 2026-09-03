@@ -400,15 +400,17 @@ func TestProxyCompletesChunkedResponseBeforeCacheStore(t *testing.T) {
 	}
 }
 
-func TestProxyCachesNegotiatedArtifactRepresentations(t *testing.T) {
+func TestProxySharesIdentityArtifactWhenResponseDoesNotVaryOnAccept(t *testing.T) {
 	upstreamHits := 0
 	var upstreamEncodings []string
+	var upstreamAccepts []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		upstreamHits++
 		upstreamEncodings = append(upstreamEncodings, request.Header.Get("Accept-Encoding"))
-		w.Header().Set("Content-Type", request.Header.Get("Accept"))
-		w.Header().Set("Vary", "Accept, Accept-Encoding")
-		_, _ = io.WriteString(w, request.Header.Get("Accept"))
+		upstreamAccepts = append(upstreamAccepts, request.Header.Get("Accept"))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Vary", "Accept-Encoding")
+		_, _ = io.WriteString(w, "artifact-body")
 	}))
 	defer upstream.Close()
 
@@ -419,12 +421,11 @@ func TestProxyCachesNegotiatedArtifactRepresentations(t *testing.T) {
 	tests := []struct {
 		accept         string
 		acceptEncoding string
-		wantStatus     string
 	}{
-		{accept: "application/xml", acceptEncoding: "gzip", wantStatus: "MISS"},
-		{accept: "application/xml", acceptEncoding: "br", wantStatus: "HIT"},
-		{accept: "application/octet-stream", acceptEncoding: "gzip, deflate", wantStatus: "MISS"},
-		{accept: "application/octet-stream", acceptEncoding: "zstd", wantStatus: "HIT"},
+		{accept: "application/octet-stream", acceptEncoding: "gzip"},
+		{acceptEncoding: "br"},
+		{accept: "*/*", acceptEncoding: "gzip, deflate"},
+		{accept: "Application/Octet-Stream", acceptEncoding: "zstd"},
 	}
 	for requestNumber, test := range tests {
 		recorder := httptest.NewRecorder()
@@ -434,30 +435,81 @@ func TestProxyCachesNegotiatedArtifactRepresentations(t *testing.T) {
 		if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
 			t.Fatal(err)
 		}
-		if got := recorder.Header().Get(cacheHeader); got != test.wantStatus {
-			t.Fatalf("request %d cache header = %q want %q", requestNumber, got, test.wantStatus)
+		wantStatus := "HIT"
+		if requestNumber == 0 {
+			wantStatus = "MISS"
 		}
-		if got := recorder.Header().Get("Content-Type"); got != test.accept {
-			t.Fatalf("request %d content type = %q want %q", requestNumber, got, test.accept)
+		if got := recorder.Header().Get(cacheHeader); got != wantStatus {
+			t.Fatalf("request %d cache header = %q want %q", requestNumber, got, wantStatus)
 		}
-		if got := recorder.Header().Get("Vary"); got != "Accept, Accept-Encoding" {
+		if got := recorder.Header().Get("Content-Type"); got != "application/octet-stream" {
+			t.Fatalf("request %d content type = %q", requestNumber, got)
+		}
+		if got := recorder.Header().Get("Vary"); got != "Accept-Encoding" {
 			t.Fatalf("request %d Vary = %q", requestNumber, got)
 		}
-		if got := recorder.Body.String(); got != test.accept {
-			t.Fatalf("request %d body = %q want %q", requestNumber, got, test.accept)
+		if got := recorder.Body.String(); got != "artifact-body" {
+			t.Fatalf("request %d body = %q", requestNumber, got)
+		}
+	}
+	if upstreamHits != 1 {
+		t.Fatalf("upstream hits = %d want 1", upstreamHits)
+	}
+	if got := strings.Join(upstreamEncodings, ","); got != "identity" {
+		t.Fatalf("upstream Accept-Encoding values = %q", got)
+	}
+	if got := strings.Join(upstreamAccepts, ","); got != "application/octet-stream" {
+		t.Fatalf("upstream Accept values = %q", got)
+	}
+	if store.getCalls != 4 || store.putCalls != 1 {
+		t.Fatalf("store calls: get = %d put = %d", store.getCalls, store.putCalls)
+	}
+	if metrics.hits["npm"] != 3 || metrics.misses["npm"] != 1 {
+		t.Fatalf("metrics: hits = %v misses = %v", metrics.hits, metrics.misses)
+	}
+}
+
+func TestProxyDoesNotStoreResponsesVaryingOnAccept(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", request.Header.Get("Accept"))
+		w.Header().Set("Vary", "Accept")
+		_, _ = io.WriteString(w, request.Header.Get("Accept"))
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	for requestNumber, accept := range []string{"application/xml", "application/octet-stream"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		request.Header.Set("Accept", accept)
+		if _, err := proxy.Serve(recorder, request, testNPMRoute(upstream.URL), exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		if got := recorder.Header().Get(cacheHeader); got != "MISS" {
+			t.Fatalf("request %d cache header = %q", requestNumber, got)
+		}
+		if got := recorder.Header().Get("Vary"); got != "Accept" {
+			t.Fatalf("request %d Vary = %q", requestNumber, got)
+		}
+		if got := recorder.Body.String(); got != accept {
+			t.Fatalf("request %d body = %q want %q", requestNumber, got, accept)
 		}
 	}
 	if upstreamHits != 2 {
 		t.Fatalf("upstream hits = %d want 2", upstreamHits)
 	}
-	if got := strings.Join(upstreamEncodings, ","); got != "identity,identity" {
-		t.Fatalf("upstream Accept-Encoding values = %q", got)
-	}
-	if store.getCalls != 4 || store.putCalls != 2 {
+	if store.getCalls != 2 || store.putCalls != 0 {
 		t.Fatalf("store calls: get = %d put = %d", store.getCalls, store.putCalls)
 	}
-	if metrics.hits["npm"] != 2 || metrics.misses["npm"] != 2 {
-		t.Fatalf("metrics: hits = %v misses = %v", metrics.hits, metrics.misses)
+	if metrics.misses["npm"] != 2 {
+		t.Fatalf("misses = %v", metrics.misses)
+	}
+	if got := metrics.bypasses[bypassMetricKey{route: "npm", reason: "response_vary"}]; got != 2 {
+		t.Fatalf("response_vary bypasses = %d", got)
 	}
 }
 
@@ -493,9 +545,9 @@ func TestCacheableResponseVary(t *testing.T) {
 		want   bool
 	}{
 		{name: "absent", want: true},
-		{name: "accept", values: []string{"Accept"}, want: true},
+		{name: "accept", values: []string{"Accept"}},
 		{name: "encoding", values: []string{"Accept-Encoding"}, want: true},
-		{name: "combined", values: []string{"Accept", "accept-encoding"}, want: true},
+		{name: "combined", values: []string{"Accept", "accept-encoding"}},
 		{name: "language", values: []string{"Accept-Language"}},
 		{name: "wildcard", values: []string{"*"}},
 	}

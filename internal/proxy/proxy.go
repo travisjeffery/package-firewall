@@ -321,10 +321,11 @@ func (p *Proxy) cacheKey(r *http.Request, route config.RouteConfig, info registr
 	if r.Body != nil && r.Body != http.NoBody {
 		return "", "request_body"
 	}
-	if representationVaries(r.Header) {
+	representation, cacheable := cacheRepresentation(r.Header)
+	if !cacheable {
 		return "", "representation"
 	}
-	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target), ""
+	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target, "representation-v1", representation, "identity"), ""
 }
 
 func (p *Proxy) responseBypassReason(resp *http.Response, target string) string {
@@ -334,7 +335,7 @@ func (p *Proxy) responseBypassReason(resp *http.Response, target string) string 
 	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != target {
 		return "upstream_redirect"
 	}
-	if resp.Header.Get("Vary") != "" {
+	if !cacheableResponseVary(resp.Header) {
 		return "response_vary"
 	}
 	if resp.Header.Get("Set-Cookie") != "" {
@@ -705,19 +706,100 @@ func hasCacheDirective(values []string, directives ...string) bool {
 	return false
 }
 
-func representationVaries(headers http.Header) bool {
-	if accept := strings.TrimSpace(strings.Join(headers.Values("Accept"), ",")); accept != "" && accept != "*/*" {
-		return true
-	}
-	if encoding := strings.TrimSpace(strings.Join(headers.Values("Accept-Encoding"), ",")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return true
-	}
+func cacheRepresentation(headers http.Header) (string, bool) {
 	for _, name := range []string{"Accept-Charset", "Accept-Language", "A-IM", "Cookie", "Origin", "Prefer", "Want-Digest"} {
 		if headers.Get(name) != "" {
-			return true
+			return "", false
 		}
 	}
-	return false
+	if !identityEncodingAccepted(headers.Values("Accept-Encoding")) {
+		return "", false
+	}
+	return strings.TrimSpace(strings.Join(headers.Values("Accept"), ",")), true
+}
+
+func identityEncodingAccepted(values []string) bool {
+	raw := strings.TrimSpace(strings.Join(values, ","))
+	if raw == "" {
+		return true
+	}
+	identitySeen := false
+	identityAccepted := false
+	wildcardSeen := false
+	wildcardAccepted := false
+	for _, item := range strings.Split(raw, ",") {
+		parts := strings.Split(item, ";")
+		coding := strings.ToLower(strings.TrimSpace(parts[0]))
+		if coding == "" {
+			return false
+		}
+		accepted, valid := encodingQualityAccepted(parts[1:])
+		if !valid {
+			return false
+		}
+		switch coding {
+		case "identity":
+			identitySeen = true
+			identityAccepted = identityAccepted || accepted
+		case "*":
+			wildcardSeen = true
+			wildcardAccepted = wildcardAccepted || accepted
+		}
+	}
+	if identitySeen {
+		return identityAccepted
+	}
+	return !wildcardSeen || wildcardAccepted
+}
+
+func encodingQualityAccepted(parameters []string) (bool, bool) {
+	if len(parameters) == 0 {
+		return true, true
+	}
+	if len(parameters) != 1 {
+		return false, false
+	}
+	name, value, found := strings.Cut(parameters[0], "=")
+	if !found || !strings.EqualFold(strings.TrimSpace(name), "q") {
+		return false, false
+	}
+	return qualityAccepted(strings.TrimSpace(value))
+}
+
+func qualityAccepted(value string) (bool, bool) {
+	whole, fraction, hasFraction := strings.Cut(value, ".")
+	if !hasFraction {
+		fraction = ""
+	}
+	if len(fraction) > 3 {
+		return false, false
+	}
+	for _, digit := range fraction {
+		if digit < '0' || digit > '9' {
+			return false, false
+		}
+	}
+	switch whole {
+	case "0":
+		return strings.ContainsAny(fraction, "123456789"), true
+	case "1":
+		return !strings.ContainsAny(fraction, "123456789"), true
+	default:
+		return false, false
+	}
+}
+
+func cacheableResponseVary(headers http.Header) bool {
+	for _, value := range headers.Values("Vary") {
+		for _, name := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "", "accept", "accept-encoding":
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.Response, error) {

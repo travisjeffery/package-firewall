@@ -400,6 +400,118 @@ func TestProxyCompletesChunkedResponseBeforeCacheStore(t *testing.T) {
 	}
 }
 
+func TestProxyCachesNegotiatedArtifactRepresentations(t *testing.T) {
+	upstreamHits := 0
+	var upstreamEncodings []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		upstreamHits++
+		upstreamEncodings = append(upstreamEncodings, request.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Type", request.Header.Get("Accept"))
+		w.Header().Set("Vary", "Accept, Accept-Encoding")
+		_, _ = io.WriteString(w, request.Header.Get("Accept"))
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	route := testNPMRoute(upstream.URL)
+	tests := []struct {
+		accept         string
+		acceptEncoding string
+		wantStatus     string
+	}{
+		{accept: "application/xml", acceptEncoding: "gzip", wantStatus: "MISS"},
+		{accept: "application/xml", acceptEncoding: "br", wantStatus: "HIT"},
+		{accept: "application/octet-stream", acceptEncoding: "gzip, deflate", wantStatus: "MISS"},
+		{accept: "application/octet-stream", acceptEncoding: "zstd", wantStatus: "HIT"},
+	}
+	for requestNumber, test := range tests {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		request.Header.Set("Accept", test.accept)
+		request.Header.Set("Accept-Encoding", test.acceptEncoding)
+		if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		if got := recorder.Header().Get(cacheHeader); got != test.wantStatus {
+			t.Fatalf("request %d cache header = %q want %q", requestNumber, got, test.wantStatus)
+		}
+		if got := recorder.Header().Get("Content-Type"); got != test.accept {
+			t.Fatalf("request %d content type = %q want %q", requestNumber, got, test.accept)
+		}
+		if got := recorder.Header().Get("Vary"); got != "Accept, Accept-Encoding" {
+			t.Fatalf("request %d Vary = %q", requestNumber, got)
+		}
+		if got := recorder.Body.String(); got != test.accept {
+			t.Fatalf("request %d body = %q want %q", requestNumber, got, test.accept)
+		}
+	}
+	if upstreamHits != 2 {
+		t.Fatalf("upstream hits = %d want 2", upstreamHits)
+	}
+	if got := strings.Join(upstreamEncodings, ","); got != "identity,identity" {
+		t.Fatalf("upstream Accept-Encoding values = %q", got)
+	}
+	if store.getCalls != 4 || store.putCalls != 2 {
+		t.Fatalf("store calls: get = %d put = %d", store.getCalls, store.putCalls)
+	}
+	if metrics.hits["npm"] != 2 || metrics.misses["npm"] != 2 {
+		t.Fatalf("metrics: hits = %v misses = %v", metrics.hits, metrics.misses)
+	}
+}
+
+func TestIdentityEncodingAccepted(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{name: "absent", want: true},
+		{name: "common compression", values: []string{"gzip, br"}, want: true},
+		{name: "identity allowed", values: []string{"gzip, identity;q=0.5, *;q=0"}, want: true},
+		{name: "identity refused", values: []string{"gzip, identity;q=0"}},
+		{name: "wildcard refused", values: []string{"gzip", "*;q=0"}},
+		{name: "identity overrides wildcard", values: []string{"gzip, *;q=0, identity"}, want: true},
+		{name: "identity refusal overrides wildcard", values: []string{"*;q=1, identity;q=0"}},
+		{name: "invalid quality", values: []string{"identity;q=invalid"}},
+		{name: "too many quality digits", values: []string{"identity;q=0.0001"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := identityEncodingAccepted(test.values); got != test.want {
+				t.Fatalf("identityEncodingAccepted(%q) = %v want %v", test.values, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCacheableResponseVary(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{name: "absent", want: true},
+		{name: "accept", values: []string{"Accept"}, want: true},
+		{name: "encoding", values: []string{"Accept-Encoding"}, want: true},
+		{name: "combined", values: []string{"Accept", "accept-encoding"}, want: true},
+		{name: "language", values: []string{"Accept-Language"}},
+		{name: "wildcard", values: []string{"*"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			header := make(http.Header)
+			for _, value := range test.values {
+				header.Add("Vary", value)
+			}
+			if got := cacheableResponseVary(header); got != test.want {
+				t.Fatalf("cacheableResponseVary(%q) = %v want %v", test.values, got, test.want)
+			}
+		})
+	}
+}
+
 func TestProxyBypassesNonCanonicalRequests(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -415,8 +527,9 @@ func TestProxyBypassesNonCanonicalRequests(t *testing.T) {
 		{name: "range", reason: "range", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Range", "bytes=0-3")},
 		{name: "conditional", reason: "conditional", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("If-None-Match", `"artifact-v1"`)},
 		{name: "cache control", reason: "request_cache_control", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Cache-Control", "no-cache")},
-		{name: "accept", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept", "application/octet-stream")},
-		{name: "encoding", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip")},
+		{name: "identity encoding refused", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip, identity;q=0")},
+		{name: "wildcard encoding refused", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip, *;q=0")},
+		{name: "invalid encoding quality", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip, identity;q=invalid")},
 		{name: "language", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Language", "en-CA")},
 		{name: "cookie", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Cookie", "session=value")},
 		{name: "body", reason: "request_body", method: http.MethodGet, info: exactArtifactInfo(), mutate: func(request *http.Request) {
@@ -490,7 +603,7 @@ func TestProxyStoresOnlyUnconditional200Responses(t *testing.T) {
 		{name: "partial status", reason: "upstream_status", status: http.StatusPartialContent, header: http.Header{"Content-Range": []string{"bytes 0-3/8"}}, body: "part", limit: 1024},
 		{name: "not found", reason: "upstream_status", status: http.StatusNotFound, body: "missing", limit: 1024},
 		{name: "rate limited", reason: "upstream_status", status: http.StatusTooManyRequests, header: http.Header{"Retry-After": []string{"60"}}, body: "rate limited", limit: 1024},
-		{name: "vary", reason: "response_vary", status: http.StatusOK, header: http.Header{"Vary": []string{"Accept"}}, body: "artifact", limit: 1024},
+		{name: "vary", reason: "response_vary", status: http.StatusOK, header: http.Header{"Vary": []string{"Accept-Language"}}, body: "artifact", limit: 1024},
 		{name: "cookie", reason: "response_set_cookie", status: http.StatusOK, header: http.Header{"Set-Cookie": []string{"session=value"}}, body: "artifact", limit: 1024},
 		{name: "content range", reason: "response_content_range", status: http.StatusOK, header: http.Header{"Content-Range": []string{"bytes 0-7/8"}}, body: "artifact", limit: 1024},
 		{name: "encoding", reason: "response_encoding", status: http.StatusOK, header: http.Header{"Content-Encoding": []string{"gzip"}}, body: "artifact", limit: 1024},

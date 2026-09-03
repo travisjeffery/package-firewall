@@ -193,8 +193,8 @@ enabling `enforce_redirect_origins`.
 The artifact cache is deliberately narrower than a general HTTP cache:
 
 - Authentication, package identification, local policy, and OSV-based decisions run before every cache lookup. A newly blocked package cannot be served from an old cache entry.
-- Only exact package artifacts identified with a concrete name, version, and PURL are eligible. Requests must be bodyless `GET`s with no query, `Range`, conditional headers, cache-revalidation directives, cookies, or representation-selecting headers.
-- Only upstream status `200` responses are stored. Redirected, ranged, encoded, `Vary`, `Set-Cookie`, `private`, `no-cache`, and `no-store` responses bypass storage.
+- Only exact package artifacts identified with a concrete name, version, and PURL are eligible. Requests must be bodyless `GET`s with no query, `Range`, conditional headers, cache-revalidation directives, cookies, or unsupported representation-selecting headers. `Accept` is part of the cache key, and clients that permit an identity response share a normalized identity-encoding representation.
+- Only upstream status `200` responses are stored. Redirected, ranged, encoded, unsupported `Vary`, `Set-Cookie`, `private`, `no-cache`, and `no-store` responses bypass storage. `Vary: Accept` and `Vary: Accept-Encoding` are supported by the representation-aware key.
 - A miss streams the complete upstream response to the client independently of a bounded temp-file capture. The capture stops at `cache.max_object_size`; bounded backend stores continue in the background and cannot delay response completion.
 - Concurrent misses for one artifact are coalesced in-process. With DynamoDB coordination enabled, one lease holder downloads and stores the artifact while other replicas poll the shared cache.
 - A hit is downloaded to bounded temp storage and checked against its recorded byte count and SHA-256 before response headers or body bytes are sent. A missing, truncated, corrupt, or unreadable entry becomes an ordinary miss.

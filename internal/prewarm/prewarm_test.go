@@ -87,6 +87,100 @@ func TestRunRejectsWarmPassMiss(t *testing.T) {
 	}
 }
 
+func TestRunUsesPluginRouteAndRemembersFallback(t *testing.T) {
+	bodies := map[string]string{
+		"/maven/org/example/library/1.0/library-1.0.jar":                                     "library",
+		"/gradle-plugins/com/example/plugin/com.example.plugin.gradle.plugin/1.0/marker.pom": "marker",
+		"/gradle-plugins/com/example/implementation/1.0/implementation-1.0.jar":              "implementation",
+	}
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests[request.URL.Path]++
+		attempt := requests[request.URL.Path]
+		mu.Unlock()
+		body, ok := bodies[request.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if attempt == 1 {
+			w.Header().Set(cacheStatusHeader, "MISS")
+		} else {
+			w.Header().Set(cacheStatusHeader, "HIT")
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	defer server.Close()
+
+	err := Run(context.Background(), RunConfig{
+		BaseURL:           server.URL,
+		RoutePrefix:       "/maven/",
+		PluginRoutePrefix: "/gradle-plugins/",
+		Concurrency:       2,
+		HTTPClient:        server.Client(),
+	}, []Artifact{
+		{Coordinate: "org.example:library:1.0", Path: "org/example/library/1.0/library-1.0.jar", SHA256: []string{sum("library")}},
+		{Coordinate: "com.example.plugin:com.example.plugin.gradle.plugin:1.0", Path: "com/example/plugin/com.example.plugin.gradle.plugin/1.0/marker.pom", SHA256: []string{sum("marker")}, pluginMarker: true},
+		{Coordinate: "com.example:implementation:1.0", Path: "com/example/implementation/1.0/implementation-1.0.jar", SHA256: []string{sum("implementation")}},
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if requests["/maven/com/example/plugin/com.example.plugin.gradle.plugin/1.0/marker.pom"] != 0 {
+		t.Fatalf("plugin marker was requested from Maven: %#v", requests)
+	}
+	if requests["/maven/com/example/implementation/1.0/implementation-1.0.jar"] != 1 {
+		t.Fatalf("fallback Maven probes = %#v", requests)
+	}
+	for path := range bodies {
+		if requests[path] != 2 {
+			t.Fatalf("requests[%q] = %d want 2", path, requests[path])
+		}
+	}
+}
+
+func TestRunReportsAllArtifactsUnavailableFromConfiguredRoutes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	err := Run(context.Background(), RunConfig{
+		BaseURL:           server.URL,
+		RoutePrefix:       "/maven/",
+		PluginRoutePrefix: "/gradle-plugins/",
+		Concurrency:       2,
+		HTTPClient:        server.Client(),
+	}, []Artifact{
+		{Coordinate: "com.example:one:1.0", Path: "com/example/one/1.0/one.jar", SHA256: []string{sum("one")}},
+		{Coordinate: "com.example:two:2.0", Path: "com/example/two/2.0/two.jar", SHA256: []string{sum("two")}},
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("prewarm unexpectedly succeeded")
+	}
+	for _, want := range []string{"2 artifacts across 2 coordinates", "com.example:one:1.0", "com.example:two:2.0"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestRunRejectsDuplicateRoutes(t *testing.T) {
+	err := Run(context.Background(), RunConfig{
+		BaseURL:           "https://packages.example",
+		RoutePrefix:       "/maven/",
+		PluginRoutePrefix: "/maven",
+	}, []Artifact{{Path: "artifact", SHA256: []string{sum("artifact")}}}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestRunRejectsChecksumMismatch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set(cacheStatusHeader, "MISS")

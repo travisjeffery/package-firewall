@@ -101,12 +101,18 @@ func run(args []string) error {
 		verificationMetadata := fs.String("verification-metadata", "gradle/verification-metadata.xml", "verification metadata path relative to root")
 		baseURL := fs.String("base-url", os.Getenv("PFW_BASE_URL"), "package firewall base URL")
 		routePrefix := fs.String("route-prefix", "/maven/", "package firewall Maven route prefix")
+		pluginRoutePrefix := fs.String("plugin-route-prefix", "", "package firewall Gradle Plugin Portal route prefix")
 		concurrency := fs.Int("concurrency", 2, "maximum concurrent artifact downloads (1-16)")
 		requestTimeout := fs.Duration("request-timeout", 10*time.Minute, "per-artifact request timeout")
 		checkOnly := fs.Bool("check", false, "validate lockfile coverage without downloading artifacts")
 		bearerTokenEnv := fs.String("bearer-token-env", "", "environment variable containing the package firewall bearer token")
 		basicUsernameEnv := fs.String("basic-username-env", "", "environment variable containing the package firewall basic username")
 		basicPasswordEnv := fs.String("basic-password-env", "", "environment variable containing the package firewall basic password")
+		var excludedCoordinates []string
+		fs.Func("exclude-coordinate", "exact locked Gradle coordinate to leave on its configured external repository (repeatable)", func(value string) error {
+			excludedCoordinates = append(excludedCoordinates, value)
+			return nil
+		})
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -129,18 +135,23 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("lockfiles=%d locked_components=%d artifacts=%d\n", manifest.Lockfiles, manifest.LockedComponents, len(manifest.Artifacts))
+		manifest, err = prewarm.ExcludeGradleCoordinates(manifest, excludedCoordinates)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("lockfiles=%d locked_components=%d plugin_markers=%d artifacts=%d excluded_components=%d excluded_artifacts=%d\n", manifest.Lockfiles, manifest.LockedComponents, manifest.PluginMarkers, len(manifest.Artifacts), manifest.ExcludedComponents, manifest.ExcludedArtifacts)
 		if *checkOnly {
 			return nil
 		}
 		return prewarm.Run(context.Background(), prewarm.RunConfig{
-			BaseURL:       *baseURL,
-			RoutePrefix:   *routePrefix,
-			Concurrency:   *concurrency,
-			HTTPClient:    &http.Client{Timeout: *requestTimeout},
-			BearerToken:   bearerToken,
-			BasicUsername: basicUsername,
-			BasicPassword: basicPassword,
+			BaseURL:           *baseURL,
+			RoutePrefix:       *routePrefix,
+			PluginRoutePrefix: *pluginRoutePrefix,
+			Concurrency:       *concurrency,
+			HTTPClient:        &http.Client{Timeout: *requestTimeout},
+			BearerToken:       bearerToken,
+			BasicUsername:     basicUsername,
+			BasicPassword:     basicPassword,
 		}, manifest.Artifacts, os.Stdout)
 	default:
 		return usage()

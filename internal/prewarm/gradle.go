@@ -15,14 +15,20 @@ import (
 )
 
 type Artifact struct {
-	Path   string
-	SHA256 []string
+	Coordinate   string
+	Path         string
+	SHA256       []string
+	pluginMarker bool
 }
 
 type GradleManifest struct {
-	Artifacts        []Artifact
-	Lockfiles        int
-	LockedComponents int
+	Artifacts          []Artifact
+	Lockfiles          int
+	LockedComponents   int
+	PluginMarkers      int
+	ExcludedComponents int
+	ExcludedArtifacts  int
+	lockedCoordinates  map[string]struct{}
 }
 
 type verificationMetadata struct {
@@ -70,14 +76,27 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 		return GradleManifest{}, err
 	}
 
-	artifactsByPath := make(map[string]map[string]struct{})
+	type artifactRecord struct {
+		coordinate   string
+		pluginMarker bool
+		checksums    map[string]struct{}
+	}
+	artifactsByPath := make(map[string]*artifactRecord)
 	foundComponents := make(map[string]struct{})
+	pluginMarkers := make(map[string]struct{})
 	for _, component := range components {
 		coordinate := gradleCoordinate(component.Group, component.Name, component.Version)
-		if _, ok := locked[coordinate]; !ok {
+		_, isLocked := locked[coordinate]
+		isPluginMarker := strings.HasSuffix(component.Name, ".gradle.plugin")
+		if !isLocked && !isPluginMarker {
 			continue
 		}
-		foundComponents[coordinate] = struct{}{}
+		if isLocked {
+			foundComponents[coordinate] = struct{}{}
+		}
+		if isPluginMarker {
+			pluginMarkers[coordinate] = struct{}{}
+		}
 		for _, artifact := range component.Artifacts {
 			if ignoredGradleArtifact(artifact.Name) {
 				continue
@@ -93,11 +112,19 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 			if err != nil {
 				return GradleManifest{}, fmt.Errorf("%s artifact %q: %w", coordinate, artifact.Name, err)
 			}
-			if artifactsByPath[artifactPath] == nil {
-				artifactsByPath[artifactPath] = make(map[string]struct{})
+			record := artifactsByPath[artifactPath]
+			if record == nil {
+				record = &artifactRecord{
+					coordinate:   coordinate,
+					pluginMarker: isPluginMarker,
+					checksums:    make(map[string]struct{}),
+				}
+				artifactsByPath[artifactPath] = record
+			} else if record.coordinate != coordinate {
+				return GradleManifest{}, fmt.Errorf("artifact path %q belongs to multiple coordinates", artifactPath)
 			}
 			for _, checksum := range checksums {
-				artifactsByPath[artifactPath][checksum] = struct{}{}
+				record.checksums[checksum] = struct{}{}
 			}
 		}
 	}
@@ -116,14 +143,64 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 	sort.Strings(paths)
 	artifacts := make([]Artifact, 0, len(paths))
 	for _, artifactPath := range paths {
-		checksums := make([]string, 0, len(artifactsByPath[artifactPath]))
-		for checksum := range artifactsByPath[artifactPath] {
+		record := artifactsByPath[artifactPath]
+		checksums := make([]string, 0, len(record.checksums))
+		for checksum := range record.checksums {
 			checksums = append(checksums, checksum)
 		}
 		sort.Strings(checksums)
-		artifacts = append(artifacts, Artifact{Path: artifactPath, SHA256: checksums})
+		artifacts = append(artifacts, Artifact{
+			Coordinate:   record.coordinate,
+			Path:         artifactPath,
+			SHA256:       checksums,
+			pluginMarker: record.pluginMarker,
+		})
 	}
-	return GradleManifest{Artifacts: artifacts, Lockfiles: lockfiles, LockedComponents: len(locked)}, nil
+	return GradleManifest{
+		Artifacts:         artifacts,
+		Lockfiles:         lockfiles,
+		LockedComponents:  len(locked),
+		PluginMarkers:     len(pluginMarkers),
+		lockedCoordinates: locked,
+	}, nil
+}
+
+func ExcludeGradleCoordinates(manifest GradleManifest, values []string) (GradleManifest, error) {
+	excluded := make(map[string]struct{})
+	for _, value := range values {
+		coordinate := strings.TrimSpace(value)
+		if coordinate == "" {
+			return GradleManifest{}, errors.New("excluded Gradle coordinate must not be empty")
+		}
+		parts := strings.Split(coordinate, ":")
+		if len(parts) != 3 || !safeMavenSegment(parts[0]) || !safeMavenSegment(parts[1]) || !safeMavenSegment(parts[2]) {
+			return GradleManifest{}, fmt.Errorf("invalid excluded Gradle coordinate %q", value)
+		}
+		if _, ok := manifest.lockedCoordinates[coordinate]; !ok {
+			return GradleManifest{}, fmt.Errorf("excluded Gradle coordinate %q is not locked", coordinate)
+		}
+		excluded[coordinate] = struct{}{}
+	}
+	if len(excluded) == 0 {
+		return manifest, nil
+	}
+
+	artifacts := make([]Artifact, 0, len(manifest.Artifacts))
+	excludedArtifacts := 0
+	for _, artifact := range manifest.Artifacts {
+		if _, ok := excluded[artifact.Coordinate]; ok {
+			excludedArtifacts++
+			continue
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	if len(artifacts) == 0 {
+		return GradleManifest{}, errors.New("excluded Gradle coordinates remove every prewarm artifact")
+	}
+	manifest.Artifacts = artifacts
+	manifest.ExcludedComponents = len(excluded)
+	manifest.ExcludedArtifacts = excludedArtifacts
+	return manifest, nil
 }
 
 func readGradleLocks(root string) (map[string]struct{}, int, error) {

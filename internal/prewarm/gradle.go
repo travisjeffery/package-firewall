@@ -51,7 +51,7 @@ type verificationChecksum struct {
 	Value string `xml:"value,attr"`
 }
 
-func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
+func DiscoverGradle(root, verificationPath string, activePluginMarkerValues ...string) (GradleManifest, error) {
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return GradleManifest{}, fmt.Errorf("resolve Gradle root: %w", err)
@@ -75,6 +75,10 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 	if err != nil {
 		return GradleManifest{}, err
 	}
+	activePluginMarkers, err := validatePluginMarkerCoordinates(activePluginMarkerValues)
+	if err != nil {
+		return GradleManifest{}, err
+	}
 
 	type artifactRecord struct {
 		coordinate   string
@@ -83,20 +87,18 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 	}
 	artifactsByPath := make(map[string]*artifactRecord)
 	foundComponents := make(map[string]struct{})
-	pluginMarkers := make(map[string]struct{})
+	foundPluginMarkers := make(map[string]struct{})
 	for _, component := range components {
 		coordinate := gradleCoordinate(component.Group, component.Name, component.Version)
 		_, isLocked := locked[coordinate]
-		isPluginMarker := strings.HasSuffix(component.Name, ".gradle.plugin")
-		if !isLocked && !isPluginMarker {
+		_, isActivePluginMarker := activePluginMarkers[coordinate]
+		if !isLocked && !isActivePluginMarker {
 			continue
 		}
 		if isLocked {
 			foundComponents[coordinate] = struct{}{}
 		}
-		if isPluginMarker {
-			pluginMarkers[coordinate] = struct{}{}
-		}
+		foundArtifact := false
 		for _, artifact := range component.Artifacts {
 			if ignoredGradleArtifact(artifact.Name) {
 				continue
@@ -108,6 +110,7 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 			if len(checksums) == 0 {
 				continue
 			}
+			foundArtifact = true
 			artifactPath, err := mavenArtifactPath(component, artifact.Name)
 			if err != nil {
 				return GradleManifest{}, fmt.Errorf("%s artifact %q: %w", coordinate, artifact.Name, err)
@@ -116,7 +119,7 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 			if record == nil {
 				record = &artifactRecord{
 					coordinate:   coordinate,
-					pluginMarker: isPluginMarker,
+					pluginMarker: isActivePluginMarker,
 					checksums:    make(map[string]struct{}),
 				}
 				artifactsByPath[artifactPath] = record
@@ -127,6 +130,9 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 				record.checksums[checksum] = struct{}{}
 			}
 		}
+		if isActivePluginMarker && foundArtifact {
+			foundPluginMarkers[coordinate] = struct{}{}
+		}
 	}
 	if len(artifactsByPath) == 0 {
 		return GradleManifest{}, errors.New("no SHA-256-verified artifacts matched the locked Gradle components")
@@ -134,6 +140,10 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 	missing := missingCoordinates(locked, foundComponents)
 	if len(missing) > 0 {
 		return GradleManifest{}, fmt.Errorf("%d locked Gradle components are absent from verification metadata (first: %s)", len(missing), strings.Join(missing[:min(len(missing), 5)], ", "))
+	}
+	missingPluginMarkers := missingCoordinates(activePluginMarkers, foundPluginMarkers)
+	if len(missingPluginMarkers) > 0 {
+		return GradleManifest{}, fmt.Errorf("%d active Gradle plugin markers have no SHA-256-verified artifact in verification metadata (first: %s)", len(missingPluginMarkers), strings.Join(missingPluginMarkers[:min(len(missingPluginMarkers), 5)], ", "))
 	}
 
 	paths := make([]string, 0, len(artifactsByPath))
@@ -160,9 +170,22 @@ func DiscoverGradle(root, verificationPath string) (GradleManifest, error) {
 		Artifacts:         artifacts,
 		Lockfiles:         lockfiles,
 		LockedComponents:  len(locked),
-		PluginMarkers:     len(pluginMarkers),
+		PluginMarkers:     len(foundPluginMarkers),
 		lockedCoordinates: locked,
 	}, nil
+}
+
+func validatePluginMarkerCoordinates(values []string) (map[string]struct{}, error) {
+	markers := make(map[string]struct{})
+	for _, value := range values {
+		coordinate := strings.TrimSpace(value)
+		parts := strings.Split(coordinate, ":")
+		if len(parts) != 3 || !safeMavenSegment(parts[0]) || !safeMavenSegment(parts[1]) || !safeMavenSegment(parts[2]) || parts[1] != parts[0]+".gradle.plugin" {
+			return nil, fmt.Errorf("invalid active Gradle plugin marker coordinate %q", value)
+		}
+		markers[coordinate] = struct{}{}
+	}
+	return markers, nil
 }
 
 func ExcludeGradleCoordinates(manifest GradleManifest, values []string) (GradleManifest, error) {

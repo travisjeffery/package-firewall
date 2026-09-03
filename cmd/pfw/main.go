@@ -109,8 +109,13 @@ func run(args []string) error {
 		basicUsernameEnv := fs.String("basic-username-env", "", "environment variable containing the package firewall basic username")
 		basicPasswordEnv := fs.String("basic-password-env", "", "environment variable containing the package firewall basic password")
 		var excludedCoordinates []string
+		var activePluginMarkers []string
 		fs.Func("exclude-coordinate", "exact locked Gradle coordinate to leave on its configured external repository (repeatable)", func(value string) error {
 			excludedCoordinates = append(excludedCoordinates, value)
+			return nil
+		})
+		fs.Func("plugin-marker-coordinate", "exact active Gradle plugin marker coordinate to prewarm through the Plugin Portal route (repeatable)", func(value string) error {
+			activePluginMarkers = append(activePluginMarkers, value)
 			return nil
 		})
 		if err := fs.Parse(args[1:]); err != nil {
@@ -131,7 +136,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		manifest, err := prewarm.DiscoverGradle(*root, *verificationMetadata)
+		manifest, err := prewarm.DiscoverGradle(*root, *verificationMetadata, activePluginMarkers...)
 		if err != nil {
 			return err
 		}

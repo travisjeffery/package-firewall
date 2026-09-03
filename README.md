@@ -86,18 +86,18 @@ go run ./cmd/pfw decide --ecosystem npm --name lodash --version 4.17.21
 ### Gradle cache prewarming
 
 `pfw prewarm` discovers committed `gradle.lockfile` files, intersects them with
-`gradle/verification-metadata.xml`, includes the checksum-verified plugin marker
-modules that Gradle does not write to dependency lockfiles, and downloads the
-resulting exact artifacts through Package Firewall with a default concurrency
-of two. A configured Gradle Plugin Portal route receives plugin markers and
-acts as a fallback for plugin implementation artifacts that are absent from
-Maven Central. Exact
-vendor or private coordinates can be excluded explicitly; stale or malformed
-exclusions fail validation. Unexpected artifacts missing from every configured
-route are reported together and fail the prewarm. The command skips source and
-Javadoc archives, validates every response against the committed SHA-256
-values, runs two complete passes using the route selected on the first pass,
-and fails unless every included artifact is a cache `HIT` on the second pass.
+`gradle/verification-metadata.xml`, and downloads the resulting exact artifacts
+through Package Firewall with a default concurrency of two. Active plugin marker
+coordinates can be selected explicitly because Gradle does not write them to
+dependency lockfiles; historical marker entries left in additive verification
+metadata are not selected automatically. A configured Gradle Plugin Portal route
+receives only those selected markers, while every ordinary locked artifact uses
+the Maven route. Exact vendor or private coordinates can be excluded explicitly;
+stale or malformed markers and exclusions fail validation. Unexpected artifacts
+missing from their configured route are reported together and fail the prewarm.
+The command skips source and Javadoc archives, validates every response against
+the committed SHA-256 values, runs two complete passes using the same route, and
+fails unless every included artifact is a cache `HIT` on the second pass.
 
 Check the manifest without making network requests:
 
@@ -113,6 +113,7 @@ export PACKAGE_FIREWALL_TOKEN=replace-me
 go run ./cmd/pfw prewarm \
   --root ../backend \
   --plugin-route-prefix /gradle-plugins/ \
+  --plugin-marker-coordinate com.example.plugin:com.example.plugin.gradle.plugin:1.2.3 \
   --exclude-coordinate com.example.vendor:private-driver:1.2.3 \
   --bearer-token-env PACKAGE_FIREWALL_TOKEN
 ```
@@ -122,6 +123,11 @@ go run ./cmd/pfw prewarm \
 on an external vendor or private repository. This keeps repository routing
 auditable and makes a dependency version change fail closed until its source is
 reviewed.
+
+`--plugin-marker-coordinate` is repeatable and accepts only the canonical
+`plugin.id:plugin.id.gradle.plugin:version` coordinate for an active plugin. The
+marker must have a SHA-256-verified artifact in verification metadata, and a
+Plugin Portal route must be configured when downloading it.
 
 Use this as one controlled job before a CI traffic wave. A non-`HIT` second
 pass is a failed rollout gate: it indicates disabled/failed cache storage,

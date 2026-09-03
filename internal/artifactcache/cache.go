@@ -57,7 +57,7 @@ func SafeHeaders(headers http.Header) http.Header {
 	safe := make(http.Header)
 	for key, values := range headers {
 		switch strings.ToLower(key) {
-		case "age", "cache-control", "content-disposition", "content-type", "date", "digest", "etag", "last-modified":
+		case "age", "cache-control", "content-disposition", "content-type", "date", "digest", "etag", "last-modified", "vary":
 			for _, value := range values {
 				safe.Add(key, value)
 			}

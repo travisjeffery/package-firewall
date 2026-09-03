@@ -250,13 +250,19 @@ coordination:
 
 The process uses the AWS SDK default credential chain. Set `AWS_REGION` to the
 bucket's region. On EKS, use an EKS Pod Identity or IRSA-backed service account
-instead of static credentials. The runtime role only needs object access under
-the configured prefix:
+instead of static credentials. The runtime role needs bucket-list access so S3
+can distinguish a missing cache object from an authorization failure, while
+object access remains confined to the configured prefix:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::company-package-firewall-cache"
+    },
     {
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],

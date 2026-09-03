@@ -93,8 +93,12 @@ resource "aws_iam_role_policy" "package_firewall_cache" {
 }
 ```
 
-The runtime policy grants only `s3:GetObject` and `s3:PutObject` under the
-configured cache prefix.
+The runtime policy grants `s3:ListBucket` on the selected bucket plus only
+`s3:GetObject` and `s3:PutObject` under the configured cache prefix. S3
+otherwise returns `403 AccessDenied` instead of `404 NoSuchKey` for a missing
+cache object, making a normal cold miss indistinguishable from a real read
+failure. Prefer the default dedicated-bucket mode when listing unrelated keys
+in an existing shared bucket would be too broad.
 
 ## Inputs
 

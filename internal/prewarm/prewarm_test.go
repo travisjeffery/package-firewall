@@ -87,11 +87,11 @@ func TestRunRejectsWarmPassMiss(t *testing.T) {
 	}
 }
 
-func TestRunUsesPluginRouteAndRemembersFallback(t *testing.T) {
+func TestRunUsesOnlyTheDeclaredArtifactRouteOnBothPasses(t *testing.T) {
 	bodies := map[string]string{
 		"/maven/org/example/library/1.0/library-1.0.jar":                                     "library",
 		"/gradle-plugins/com/example/plugin/com.example.plugin.gradle.plugin/1.0/marker.pom": "marker",
-		"/gradle-plugins/com/example/implementation/1.0/implementation-1.0.jar":              "implementation",
+		"/maven/com/example/implementation/1.0/implementation-1.0.jar":                       "implementation",
 	}
 	var mu sync.Mutex
 	requests := make(map[string]int)
@@ -134,13 +134,65 @@ func TestRunUsesPluginRouteAndRemembersFallback(t *testing.T) {
 	if requests["/maven/com/example/plugin/com.example.plugin.gradle.plugin/1.0/marker.pom"] != 0 {
 		t.Fatalf("plugin marker was requested from Maven: %#v", requests)
 	}
-	if requests["/maven/com/example/implementation/1.0/implementation-1.0.jar"] != 1 {
-		t.Fatalf("fallback Maven probes = %#v", requests)
+	if requests["/gradle-plugins/com/example/implementation/1.0/implementation-1.0.jar"] != 0 {
+		t.Fatalf("ordinary artifact was requested from the Plugin Portal route: %#v", requests)
 	}
 	for path := range bodies {
 		if requests[path] != 2 {
 			t.Fatalf("requests[%q] = %d want 2", path, requests[path])
 		}
+	}
+}
+
+func TestRunDoesNotFallbackOrdinaryArtifactsToPluginRoute(t *testing.T) {
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests[request.URL.Path]++
+		mu.Unlock()
+		if strings.HasPrefix(request.URL.Path, "/gradle-plugins/") {
+			w.Header().Set(cacheStatusHeader, "MISS")
+			_, _ = io.WriteString(w, "implementation")
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	err := Run(context.Background(), RunConfig{
+		BaseURL:           server.URL,
+		RoutePrefix:       "/maven/",
+		PluginRoutePrefix: "/gradle-plugins/",
+		Concurrency:       1,
+		HTTPClient:        server.Client(),
+	}, []Artifact{{
+		Coordinate: "com.example:implementation:1.0",
+		Path:       "com/example/implementation/1.0/implementation-1.0.jar",
+		SHA256:     []string{sum("implementation")},
+	}}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "unavailable from configured Package Firewall routes") {
+		t.Fatalf("error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests["/maven/com/example/implementation/1.0/implementation-1.0.jar"] != 1 || requests["/gradle-plugins/com/example/implementation/1.0/implementation-1.0.jar"] != 0 {
+		t.Fatalf("requests = %#v", requests)
+	}
+}
+
+func TestRunRequiresPluginRouteForSelectedMarkers(t *testing.T) {
+	err := Run(context.Background(), RunConfig{
+		BaseURL:     "https://packages.example",
+		RoutePrefix: "/maven/",
+	}, []Artifact{{
+		Coordinate:   "com.example:com.example.gradle.plugin:1.0",
+		Path:         "com/example/com.example.gradle.plugin/1.0/marker.pom",
+		SHA256:       []string{sum("marker")},
+		pluginMarker: true,
+	}}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "plugin route prefix is required") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

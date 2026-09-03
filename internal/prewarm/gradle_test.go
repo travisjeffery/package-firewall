@@ -55,7 +55,7 @@ empty=testRuntimeClasspath
 	}
 }
 
-func TestDiscoverGradleMarksPluginMarkerModules(t *testing.T) {
+func TestDiscoverGradleIncludesOnlySelectedActivePluginMarkers(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "gradle.lockfile"), "org.example:library:1.0=runtimeClasspath\n")
 	writeFile(t, filepath.Join(root, "gradle", "verification-metadata.xml"), `
@@ -67,11 +67,14 @@ func TestDiscoverGradleMarksPluginMarkerModules(t *testing.T) {
     <component group="com.example.plugin" name="com.example.plugin.gradle.plugin" version="1.0">
       <artifact name="com.example.plugin.gradle.plugin-1.0.pom"><sha256 value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/></artifact>
     </component>
+    <component group="com.example.stale" name="com.example.stale.gradle.plugin" version="0.9">
+      <artifact name="com.example.stale.gradle.plugin-0.9.pom"><sha256 value="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"/></artifact>
+    </component>
   </components>
 </verification-metadata>
 `)
 
-	manifest, err := DiscoverGradle(root, "")
+	manifest, err := DiscoverGradle(root, "", "com.example.plugin:com.example.plugin.gradle.plugin:1.0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +83,35 @@ func TestDiscoverGradleMarksPluginMarkerModules(t *testing.T) {
 	}
 	if !manifest.Artifacts[0].pluginMarker {
 		t.Fatalf("plugin marker artifact = %#v", manifest.Artifacts[0])
+	}
+	for _, artifact := range manifest.Artifacts {
+		if strings.Contains(artifact.Coordinate, "stale") {
+			t.Fatalf("stale plugin marker was selected: %#v", artifact)
+		}
+	}
+}
+
+func TestDiscoverGradleRejectsInvalidOrUnverifiedActivePluginMarkers(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "gradle.lockfile"), "org.example:library:1.0=runtimeClasspath\n")
+	writeFile(t, filepath.Join(root, "gradle", "verification-metadata.xml"), `
+<verification-metadata>
+  <components>
+    <component group="org.example" name="library" version="1.0">
+      <artifact name="library-1.0.jar"><sha256 value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/></artifact>
+    </component>
+  </components>
+</verification-metadata>
+`)
+
+	for _, marker := range []string{
+		"com.example:wrong-name:1.0",
+		"com.example:com.example.gradle.plugin:1.0",
+	} {
+		_, err := DiscoverGradle(root, "", marker)
+		if err == nil {
+			t.Fatalf("marker %q unexpectedly succeeded", marker)
+		}
 	}
 }
 

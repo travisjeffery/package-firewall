@@ -43,6 +43,11 @@ func Run(ctx context.Context, cfg RunConfig, artifacts []Artifact, output io.Wri
 	if len(artifacts) == 0 {
 		return errors.New("prewarm manifest contains no artifacts")
 	}
+	for _, artifact := range artifacts {
+		if artifact.pluginMarker && normalized.PluginRoutePrefix == "" {
+			return errors.New("prewarm plugin route prefix is required for active plugin markers")
+		}
+	}
 	firstStats, selectedRoutes, err := runPass(ctx, normalized, artifacts, nil, false)
 	if err != nil {
 		return fmt.Errorf("prewarm pass 1: %w", err)
@@ -231,11 +236,7 @@ func routeCandidates(cfg RunConfig, artifact Artifact) []string {
 	if artifact.pluginMarker && cfg.PluginRoutePrefix != "" {
 		return []string{cfg.PluginRoutePrefix}
 	}
-	routes := []string{cfg.RoutePrefix}
-	if cfg.PluginRoutePrefix != "" {
-		routes = append(routes, cfg.PluginRoutePrefix)
-	}
-	return routes
+	return []string{cfg.RoutePrefix}
 }
 
 func fetchArtifact(ctx context.Context, cfg RunConfig, artifact Artifact, routes []string) (string, string, bool, error) {

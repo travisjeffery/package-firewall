@@ -103,7 +103,9 @@ func run(args []string) error {
 		routePrefix := fs.String("route-prefix", "/maven/", "package firewall Maven route prefix")
 		pluginRoutePrefix := fs.String("plugin-route-prefix", "", "package firewall Gradle Plugin Portal route prefix")
 		concurrency := fs.Int("concurrency", 2, "maximum concurrent artifact downloads (1-16)")
+		rateLimitRetries := fs.Int("rate-limit-retries", 8, "maximum retries for upstream rate limits (1-16)")
 		requestTimeout := fs.Duration("request-timeout", 10*time.Minute, "per-artifact request timeout")
+		stateFile := fs.String("state-file", "", "checkpoint file for resumable prewarming")
 		checkOnly := fs.Bool("check", false, "validate lockfile coverage without downloading artifacts")
 		bearerTokenEnv := fs.String("bearer-token-env", "", "environment variable containing the package firewall bearer token")
 		basicUsernameEnv := fs.String("basic-username-env", "", "environment variable containing the package firewall basic username")
@@ -123,6 +125,9 @@ func run(args []string) error {
 		}
 		if *requestTimeout <= 0 {
 			return errors.New("prewarm request timeout must be positive")
+		}
+		if *rateLimitRetries < 1 || *rateLimitRetries > 16 {
+			return errors.New("prewarm rate-limit retries must be between 1 and 16")
 		}
 		bearerToken, err := configuredSecret(*bearerTokenEnv)
 		if err != nil {
@@ -153,6 +158,8 @@ func run(args []string) error {
 			RoutePrefix:       *routePrefix,
 			PluginRoutePrefix: *pluginRoutePrefix,
 			Concurrency:       *concurrency,
+			RateLimitRetries:  *rateLimitRetries,
+			StateFile:         *stateFile,
 			HTTPClient:        &http.Client{Timeout: *requestTimeout},
 			BearerToken:       bearerToken,
 			BasicUsername:     basicUsername,

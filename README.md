@@ -98,6 +98,9 @@ missing from their configured route are reported together and fail the prewarm.
 The command skips source and Javadoc archives, validates every response against
 the committed SHA-256 values, runs two complete passes using the same route, and
 fails unless every included artifact is a cache `HIT` on the second pass.
+Rate-limited responses are retried after their `Retry-After` delay, and an
+optional checkpoint records completed first-pass artifacts so an interrupted
+run can resume without repeating them.
 
 Check the manifest without making network requests:
 
@@ -117,6 +120,9 @@ go run ./cmd/pfw prewarm \
   --exclude-coordinate com.example.vendor:private-driver:1.2.3 \
   --bearer-token-env PACKAGE_FIREWALL_TOKEN
 ```
+
+For a bounded, resumable run, add `--state-file` and keep the file between
+runs. `--rate-limit-retries` bounds retries after upstream `429` responses.
 
 `--exclude-coordinate` is repeatable and accepts only a complete locked
 `group:name:version`. Use it only for a dependency that the Gradle build keeps

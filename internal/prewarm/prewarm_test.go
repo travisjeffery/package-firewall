@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,6 +72,109 @@ func TestRunWarmsThenRequiresCacheHits(t *testing.T) {
 		if hits[path] != 2 {
 			t.Fatalf("hits[%q] = %d want 2", path, hits[path])
 		}
+	}
+}
+
+func TestRunRetriesRateLimitedArtifact(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		attempt := requests
+		mu.Unlock()
+		if attempt == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if attempt == 2 {
+			w.Header().Set(cacheStatusHeader, "MISS")
+		} else {
+			w.Header().Set(cacheStatusHeader, "HIT")
+		}
+		_, _ = io.WriteString(w, "artifact")
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	err := Run(context.Background(), RunConfig{
+		BaseURL:          server.URL,
+		Concurrency:      1,
+		RateLimitRetries: 1,
+		HTTPClient:       server.Client(),
+	}, []Artifact{{Path: "org/example/library/1.0/library-1.0.jar", SHA256: []string{sum("artifact")}}}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "pass=1 artifacts=1 cache_hits=0 cache_misses=1\npass=2 artifacts=1 cache_hits=1 cache_misses=0\n" {
+		t.Fatalf("output = %q", output.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if requests != 3 {
+		t.Fatalf("requests = %d want 3", requests)
+	}
+}
+
+func TestRunResumesFromCheckpoint(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "prewarm-state.json")
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	failSecond := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests[request.URL.Path]++
+		attempt := requests[request.URL.Path]
+		shouldFail := failSecond && strings.HasSuffix(request.URL.Path, "two.jar")
+		mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if attempt == 1 {
+			w.Header().Set(cacheStatusHeader, "MISS")
+		} else {
+			w.Header().Set(cacheStatusHeader, "HIT")
+		}
+		_, _ = io.WriteString(w, strings.TrimSuffix(filepath.Base(request.URL.Path), ".jar"))
+	}))
+	defer server.Close()
+	artifacts := []Artifact{
+		{Path: "org/example/library/1.0/one.jar", SHA256: []string{sum("one")}},
+		{Path: "org/example/library/1.0/two.jar", SHA256: []string{sum("two")}},
+	}
+	cfg := RunConfig{BaseURL: server.URL, Concurrency: 1, StateFile: stateFile, HTTPClient: server.Client()}
+	if err := Run(context.Background(), cfg, artifacts, io.Discard); err == nil || !strings.Contains(err.Error(), "HTTP 502") {
+		t.Fatalf("first run error = %v", err)
+	}
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file checkpointFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatal(err)
+	}
+	if len(file.Completed) != 1 || file.Completed[artifacts[0].Path].Status != "MISS" {
+		t.Fatalf("checkpoint = %#v", file)
+	}
+
+	mu.Lock()
+	failSecond = false
+	mu.Unlock()
+	if err := Run(context.Background(), cfg, artifacts, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	firstPath := "/maven/" + artifacts[0].Path
+	secondPath := "/maven/" + artifacts[1].Path
+	if requests[firstPath] != 2 {
+		t.Fatalf("resumed first artifact requests = %d want 2", requests[firstPath])
+	}
+	if requests[secondPath] != 3 {
+		t.Fatalf("resumed second artifact requests = %d want 3", requests[secondPath])
 	}
 }
 

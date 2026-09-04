@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,8 @@ type RunConfig struct {
 	RoutePrefix       string
 	PluginRoutePrefix string
 	Concurrency       int
+	RateLimitRetries  int
+	StateFile         string
 	HTTPClient        *http.Client
 	BearerToken       string
 	BasicUsername     string
@@ -48,14 +51,18 @@ func Run(ctx context.Context, cfg RunConfig, artifacts []Artifact, output io.Wri
 			return errors.New("prewarm plugin route prefix is required for active plugin markers")
 		}
 	}
-	firstStats, selectedRoutes, err := runPass(ctx, normalized, artifacts, nil, false)
+	checkpoint, err := loadCheckpoint(normalized.StateFile, normalized, artifacts)
+	if err != nil {
+		return err
+	}
+	firstStats, selectedRoutes, err := runPass(ctx, normalized, artifacts, nil, false, checkpoint)
 	if err != nil {
 		return fmt.Errorf("prewarm pass 1: %w", err)
 	}
 	if err := writePassSummary(output, 1, firstStats); err != nil {
 		return err
 	}
-	secondStats, _, err := runPass(ctx, normalized, artifacts, selectedRoutes, true)
+	secondStats, _, err := runPass(ctx, normalized, artifacts, selectedRoutes, true, nil)
 	if err != nil {
 		return fmt.Errorf("prewarm pass 2: %w", err)
 	}
@@ -88,6 +95,12 @@ func normalizeRunConfig(cfg RunConfig) (RunConfig, error) {
 	}
 	if cfg.Concurrency < 1 || cfg.Concurrency > 16 {
 		return RunConfig{}, errors.New("prewarm concurrency must be between 1 and 16")
+	}
+	if cfg.RateLimitRetries == 0 {
+		cfg.RateLimitRetries = 8
+	}
+	if cfg.RateLimitRetries < 1 || cfg.RateLimitRetries > 16 {
+		return RunConfig{}, errors.New("prewarm rate-limit retries must be between 1 and 16")
 	}
 	if (cfg.BasicUsername == "") != (cfg.BasicPassword == "") {
 		return RunConfig{}, errors.New("prewarm basic username and password must be set together")
@@ -152,7 +165,7 @@ type artifactJob struct {
 	artifact Artifact
 }
 
-func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, selectedRoutes []string, requireHit bool) (PassStats, []string, error) {
+func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, selectedRoutes []string, requireHit bool, checkpoint *checkpoint) (PassStats, []string, error) {
 	if selectedRoutes != nil && len(selectedRoutes) != len(artifacts) {
 		return PassStats{}, nil, errors.New("selected prewarm routes do not match artifact manifest")
 	}
@@ -177,11 +190,52 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 		go func() {
 			defer workers.Done()
 			for job := range jobs {
-				routes := routeCandidates(cfg, job.artifact)
-				if selectedRoutes != nil {
-					routes = []string{selectedRoutes[job.index]}
+				if checkpoint != nil {
+					if entry, ok := checkpoint.completed(job.artifact); ok {
+						discoveredRoutes[job.index] = entry.Route
+						atomic.AddInt64(&stats.Artifacts, 1)
+						switch entry.Status {
+						case "HIT":
+							atomic.AddInt64(&stats.Hits, 1)
+						case "MISS":
+							atomic.AddInt64(&stats.Misses, 1)
+						default:
+							fail(fmt.Errorf("%s: checkpoint has unexpected cache status %q", job.artifact.Path, entry.Status))
+							return
+						}
+						continue
+					}
 				}
-				status, route, found, err := fetchArtifact(ctx, cfg, job.artifact, routes)
+				rateLimitAttempts := 0
+				var status, route string
+				var found bool
+				var err error
+				for {
+					routes := routeCandidates(cfg, job.artifact)
+					if selectedRoutes != nil {
+						routes = []string{selectedRoutes[job.index]}
+					}
+					status, route, found, err = fetchArtifact(ctx, cfg, job.artifact, routes)
+					if err == nil {
+						break
+					}
+					var rateErr *rateLimitError
+					if !errors.As(err, &rateErr) {
+						break
+					}
+					if rateLimitAttempts >= cfg.RateLimitRetries {
+						err = fmt.Errorf("%w after %d retries", err, rateLimitAttempts)
+						break
+					}
+					rateLimitAttempts++
+					delay := rateErr.Delay
+					if !rateErr.Valid {
+						delay = rateLimitBackoff(rateLimitAttempts - 1)
+					}
+					if err := waitContext(ctx, delay); err != nil {
+						return
+					}
+				}
 				if err != nil {
 					fail(fmt.Errorf("%s: %w", job.artifact.Path, err))
 					return
@@ -196,6 +250,12 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 				if requireHit && status != "HIT" {
 					fail(fmt.Errorf("%s: second pass returned cache status %q, expected HIT", job.artifact.Path, status))
 					return
+				}
+				if checkpoint != nil {
+					if err := checkpoint.record(job.artifact, route, status); err != nil {
+						fail(fmt.Errorf("%s: save checkpoint: %w", job.artifact.Path, err))
+						return
+					}
 				}
 				atomic.AddInt64(&stats.Artifacts, 1)
 				switch status {
@@ -252,6 +312,34 @@ func fetchArtifact(ctx context.Context, cfg RunConfig, artifact Artifact, routes
 	return "", "", false, nil
 }
 
+type rateLimitError struct {
+	Delay  time.Duration
+	Valid  bool
+	Header string
+}
+
+func (e *rateLimitError) Error() string {
+	return fmt.Sprintf("package firewall returned 429 with Retry-After %q", e.Header)
+}
+
+func rateLimitBackoff(attempt int) time.Duration {
+	return time.Second << min(attempt, 5)
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifact, route string) (string, bool, error) {
 	target, err := url.JoinPath(cfg.BaseURL, route, artifact.Path)
 	if err != nil {
@@ -278,7 +366,9 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifac
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		if response.StatusCode == http.StatusTooManyRequests {
-			return "", false, fmt.Errorf("package firewall returned 429 with Retry-After %q", response.Header.Get("Retry-After"))
+			header := strings.TrimSpace(response.Header.Get("Retry-After"))
+			delay, valid := retryAfterDelay(header, time.Now())
+			return "", false, &rateLimitError{Delay: delay, Valid: valid, Header: header}
 		}
 		return "", false, fmt.Errorf("package firewall returned HTTP %d", response.StatusCode)
 	}
@@ -291,6 +381,24 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifac
 		return "", false, fmt.Errorf("SHA-256 mismatch: got %s", actual)
 	}
 	return strings.ToUpper(strings.TrimSpace(response.Header.Get(cacheStatusHeader))), true, nil
+}
+
+func retryAfterDelay(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 32); err == nil {
+		if seconds < 0 {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	return max(when.Sub(now), 0), true
 }
 
 func unavailableArtifactsError(artifacts []Artifact) error {

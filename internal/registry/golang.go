@@ -20,11 +20,13 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 		version = strings.TrimSuffix(file, ".info")
 		info.Kind = "metadata"
 		info.NeedsDecision = true
+		info.Cacheable = true
 		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".mod"):
 		version = strings.TrimSuffix(file, ".mod")
 		info.Kind = "metadata"
 		info.NeedsDecision = true
+		info.Cacheable = true
 		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".zip"):
 		version = strings.TrimSuffix(file, ".zip")

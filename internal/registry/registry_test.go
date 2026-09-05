@@ -85,7 +85,7 @@ func TestIdentifyGoModuleMetadata(t *testing.T) {
 			if info.Package.PURL != "pkg:golang/golang.org/x/crypto@v0.0.0-20210220033148-5ea612d1eb83" {
 				t.Fatalf("purl = %q", info.Package.PURL)
 			}
-			if info.Kind != "metadata" || !info.NeedsDecision || !info.SkipVulnerabilityCheck {
+			if info.Kind != "metadata" || !info.NeedsDecision || !info.Cacheable || !info.SkipVulnerabilityCheck {
 				t.Fatalf("info = %#v", info)
 			}
 		})

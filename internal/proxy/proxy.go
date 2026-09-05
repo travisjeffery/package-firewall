@@ -303,7 +303,7 @@ func (p *Proxy) cacheKey(r *http.Request, route config.RouteConfig, info registr
 	if r.Method != http.MethodGet {
 		return "", "method"
 	}
-	if info.Kind != "artifact" || !info.NeedsDecision || info.Package.PURL == "" || info.Package.Name == "" || info.Package.Version == "" {
+	if (info.Kind != "artifact" && !info.Cacheable) || !info.NeedsDecision || info.Package.PURL == "" || info.Package.Name == "" || info.Package.Version == "" {
 		return "", "not_exact_artifact"
 	}
 	if r.URL.RawQuery != "" || r.URL.ForceQuery {

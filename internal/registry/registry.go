@@ -22,6 +22,7 @@ type RequestInfo struct {
 	UpstreamPath           string
 	FileUpstream           bool
 	NeedsDecision          bool
+	Cacheable              bool
 	SkipVulnerabilityCheck bool
 }
 

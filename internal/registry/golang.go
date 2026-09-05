@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/travisjeffery/package-firewall/internal/policy"
+	"golang.org/x/mod/module"
 )
 
 func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
@@ -12,7 +13,7 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 	if idx < 0 {
 		return info
 	}
-	module := unescapeGoModule(relative[:idx])
+	moduleName := unescapeGoModule(relative[:idx])
 	file := relative[idx+len(marker):]
 	version := file
 	switch {
@@ -20,11 +21,13 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 		version = strings.TrimSuffix(file, ".info")
 		info.Kind = "metadata"
 		info.NeedsDecision = true
+		info.Cacheable = isCanonicalGoModuleVersion(version)
 		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".mod"):
 		version = strings.TrimSuffix(file, ".mod")
 		info.Kind = "metadata"
 		info.NeedsDecision = true
+		info.Cacheable = isCanonicalGoModuleVersion(version)
 		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".zip"):
 		version = strings.TrimSuffix(file, ".zip")
@@ -35,11 +38,16 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 	}
 	info.Package = policy.Package{
 		Ecosystem: route.Ecosystem,
-		Name:      module,
+		Name:      moduleName,
 		Version:   version,
-		PURL:      purl("go", module, version),
+		PURL:      purl("go", moduleName, version),
 	}
 	return info
+}
+
+func isCanonicalGoModuleVersion(version string) bool {
+	unescapedVersion, err := module.UnescapeVersion(version)
+	return err == nil && module.CanonicalVersion(unescapedVersion) == unescapedVersion
 }
 
 func unescapeGoModule(module string) string {

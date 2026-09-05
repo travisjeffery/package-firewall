@@ -71,6 +71,48 @@ func TestProxyCachesIntegrityCheckedArtifact(t *testing.T) {
 	}
 }
 
+func TestProxyCachesGoModuleMetadata(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "module go 1.26.0\n")
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	proxy := newTestCachingProxy(t, store, newTestCacheMetrics(), 1024)
+	route := config.RouteConfig{Name: "go", Ecosystem: "go", PathPrefix: "/go/", UpstreamURL: upstream.URL + "/"}
+	info := registry.RequestInfo{
+		Kind:          "metadata",
+		NeedsDecision: true,
+		Cacheable:     true,
+		UpstreamPath:  "/golang.org/x/mod/@v/v0.30.0.mod",
+		Package: policy.Package{
+			Ecosystem: "go",
+			Name:      "golang.org/x/mod",
+			Version:   "v0.30.0",
+			PURL:      "pkg:golang/golang.org/x/mod@v0.30.0",
+		},
+	}
+	for requestNumber, wantCacheStatus := range []string{"MISS", "HIT"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/go/golang.org/x/mod/@v/v0.30.0.mod", nil)
+		if _, err := proxy.Serve(recorder, request, route, info); err != nil {
+			t.Fatal(err)
+		}
+		if recorder.Code != http.StatusOK || recorder.Body.String() != "module go 1.26.0\n" {
+			t.Fatalf("request %d response = %d %q", requestNumber, recorder.Code, recorder.Body.String())
+		}
+		if got := recorder.Header().Get(cacheHeader); got != wantCacheStatus {
+			t.Fatalf("request %d cache header = %q want %q", requestNumber, got, wantCacheStatus)
+		}
+	}
+	if upstreamHits != 1 || store.getCalls != 2 || store.putCalls != 1 {
+		t.Fatalf("upstream/store calls = %d/%d/%d", upstreamHits, store.getCalls, store.putCalls)
+	}
+}
+
 func TestProxyCoalescesConcurrentCacheMissesInProcess(t *testing.T) {
 	const requests = 24
 	var upstreamHits atomic.Int32

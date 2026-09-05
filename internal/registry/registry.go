@@ -17,11 +17,12 @@ type Route struct {
 }
 
 type RequestInfo struct {
-	Package       policy.Package
-	Kind          string
-	UpstreamPath  string
-	FileUpstream  bool
-	NeedsDecision bool
+	Package                policy.Package
+	Kind                   string
+	UpstreamPath           string
+	FileUpstream           bool
+	NeedsDecision          bool
+	SkipVulnerabilityCheck bool
 }
 
 func Identify(route Route, requestPath string) RequestInfo {

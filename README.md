@@ -72,7 +72,7 @@ allow:
   - "pkg:golang/golang.org/x/mod@v0.30.0"
 ```
 
-Explicit deny rules take precedence over allow and warn rules. Explicit allow rules skip OSV checks. Unmatched package versions are checked against OSV when enabled.
+Explicit deny rules take precedence over allow and warn rules. Explicit allow rules skip OSV checks. Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy but skips OSV; `.zip` module archives remain evaluated.
 
 ## CLI
 

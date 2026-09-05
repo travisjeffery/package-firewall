@@ -103,7 +103,8 @@ func run(args []string) error {
 		routePrefix := fs.String("route-prefix", "/maven/", "package firewall Maven route prefix")
 		pluginRoutePrefix := fs.String("plugin-route-prefix", "", "package firewall Gradle Plugin Portal route prefix")
 		concurrency := fs.Int("concurrency", 2, "maximum concurrent artifact downloads (1-16)")
-		rateLimitRetries := fs.Int("rate-limit-retries", 8, "maximum retries for upstream rate limits (1-16)")
+		minRequestInterval := fs.Duration("min-request-interval", 0, "minimum spacing between first-pass artifact requests")
+		rateLimitRetries := fs.Int("rate-limit-retries", 1, "maximum retries for upstream rate limits (1-16)")
 		requestTimeout := fs.Duration("request-timeout", 10*time.Minute, "per-artifact request timeout")
 		stateFile := fs.String("state-file", "", "checkpoint file for resumable prewarming")
 		checkOnly := fs.Bool("check", false, "validate lockfile coverage without downloading artifacts")
@@ -128,6 +129,9 @@ func run(args []string) error {
 		}
 		if *rateLimitRetries < 1 || *rateLimitRetries > 16 {
 			return errors.New("prewarm rate-limit retries must be between 1 and 16")
+		}
+		if *minRequestInterval < 0 {
+			return errors.New("prewarm minimum request interval must not be negative")
 		}
 		bearerToken, err := configuredSecret(*bearerTokenEnv)
 		if err != nil {
@@ -154,16 +158,17 @@ func run(args []string) error {
 			return nil
 		}
 		return prewarm.Run(context.Background(), prewarm.RunConfig{
-			BaseURL:           *baseURL,
-			RoutePrefix:       *routePrefix,
-			PluginRoutePrefix: *pluginRoutePrefix,
-			Concurrency:       *concurrency,
-			RateLimitRetries:  *rateLimitRetries,
-			StateFile:         *stateFile,
-			HTTPClient:        &http.Client{Timeout: *requestTimeout},
-			BearerToken:       bearerToken,
-			BasicUsername:     basicUsername,
-			BasicPassword:     basicPassword,
+			BaseURL:            *baseURL,
+			RoutePrefix:        *routePrefix,
+			PluginRoutePrefix:  *pluginRoutePrefix,
+			Concurrency:        *concurrency,
+			MinRequestInterval: *minRequestInterval,
+			RateLimitRetries:   *rateLimitRetries,
+			StateFile:          *stateFile,
+			HTTPClient:         &http.Client{Timeout: *requestTimeout},
+			BearerToken:        bearerToken,
+			BasicUsername:      basicUsername,
+			BasicPassword:      basicPassword,
 		}, manifest.Artifacts, os.Stdout)
 	default:
 		return usage()

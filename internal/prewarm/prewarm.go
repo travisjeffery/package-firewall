@@ -20,16 +20,17 @@ import (
 const cacheStatusHeader = "X-Package-Firewall-Cache"
 
 type RunConfig struct {
-	BaseURL           string
-	RoutePrefix       string
-	PluginRoutePrefix string
-	Concurrency       int
-	RateLimitRetries  int
-	StateFile         string
-	HTTPClient        *http.Client
-	BearerToken       string
-	BasicUsername     string
-	BasicPassword     string
+	BaseURL            string
+	RoutePrefix        string
+	PluginRoutePrefix  string
+	Concurrency        int
+	MinRequestInterval time.Duration
+	RateLimitRetries   int
+	StateFile          string
+	HTTPClient         *http.Client
+	BearerToken        string
+	BasicUsername      string
+	BasicPassword      string
 }
 
 type PassStats struct {
@@ -96,8 +97,11 @@ func normalizeRunConfig(cfg RunConfig) (RunConfig, error) {
 	if cfg.Concurrency < 1 || cfg.Concurrency > 16 {
 		return RunConfig{}, errors.New("prewarm concurrency must be between 1 and 16")
 	}
+	if cfg.MinRequestInterval < 0 {
+		return RunConfig{}, errors.New("prewarm minimum request interval must not be negative")
+	}
 	if cfg.RateLimitRetries == 0 {
-		cfg.RateLimitRetries = 8
+		cfg.RateLimitRetries = 1
 	}
 	if cfg.RateLimitRetries < 1 || cfg.RateLimitRetries > 16 {
 		return RunConfig{}, errors.New("prewarm rate-limit retries must be between 1 and 16")
@@ -165,6 +169,34 @@ type artifactJob struct {
 	artifact Artifact
 }
 
+type requestPacer struct {
+	minInterval time.Duration
+	mu          sync.Mutex
+	next        time.Time
+}
+
+func newRequestPacer(minInterval time.Duration) *requestPacer {
+	if minInterval == 0 {
+		return nil
+	}
+	return &requestPacer{minInterval: minInterval}
+}
+
+func (p *requestPacer) wait(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	now := time.Now()
+	start := p.next
+	if start.Before(now) {
+		start = now
+	}
+	p.next = start.Add(p.minInterval)
+	p.mu.Unlock()
+	return waitContext(ctx, time.Until(start))
+}
+
 func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, selectedRoutes []string, requireHit bool, checkpoint *checkpoint) (PassStats, []string, error) {
 	if selectedRoutes != nil && len(selectedRoutes) != len(artifacts) {
 		return PassStats{}, nil, errors.New("selected prewarm routes do not match artifact manifest")
@@ -178,6 +210,10 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 	var errOnce sync.Once
 	var unavailable []Artifact
 	var unavailableMu sync.Mutex
+	pacer := newRequestPacer(0)
+	if !requireHit {
+		pacer = newRequestPacer(cfg.MinRequestInterval)
+	}
 	fail := func(err error) {
 		errOnce.Do(func() {
 			firstErr = err
@@ -214,6 +250,9 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 					routes := routeCandidates(cfg, job.artifact)
 					if selectedRoutes != nil {
 						routes = []string{selectedRoutes[job.index]}
+					}
+					if err := pacer.wait(ctx); err != nil {
+						return
 					}
 					status, route, found, err = fetchArtifact(ctx, cfg, job.artifact, routes)
 					if err == nil {

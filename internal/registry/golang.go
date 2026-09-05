@@ -36,11 +36,15 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 	default:
 		return info
 	}
+	policyVersion := version
+	if unescapedVersion, err := module.UnescapeVersion(version); err == nil {
+		policyVersion = unescapedVersion
+	}
 	info.Package = policy.Package{
 		Ecosystem: route.Ecosystem,
 		Name:      moduleName,
-		Version:   version,
-		PURL:      purl("go", moduleName, version),
+		Version:   policyVersion,
+		PURL:      purl("go", moduleName, policyVersion),
 	}
 	return info
 }

@@ -80,22 +80,27 @@ func TestIdentifyGoModule(t *testing.T) {
 
 func TestIdentifyGoModuleMetadata(t *testing.T) {
 	tests := []struct {
-		name      string
-		version   string
-		extension string
-		cacheable bool
+		name        string
+		version     string
+		extension   string
+		cacheable   bool
+		purlVersion string
 	}{
 		{name: "canonical pseudo version info", version: "v0.0.0-20210220033148-5ea612d1eb83", extension: "info", cacheable: true},
 		{name: "canonical release mod", version: "v0.30.0", extension: "mod", cacheable: true},
 		{name: "canonical incompatible release info", version: "v2.0.0+incompatible", extension: "info", cacheable: true},
-		{name: "escaped canonical prerelease mod", version: "v1.2.3-!r!c1", extension: "mod", cacheable: true},
+		{name: "escaped canonical prerelease mod", version: "v1.2.3-!r!c1", extension: "mod", cacheable: true, purlVersion: "v1.2.3-RC1"},
 		{name: "branch info", version: "master", extension: "info", cacheable: false},
 		{name: "version prefix mod", version: "v1.2", extension: "mod", cacheable: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			info := Identify(Route{Ecosystem: "go", PathPrefix: "/go/"}, "/go/golang.org/x/crypto/@v/"+test.version+"."+test.extension)
-			if info.Package.PURL != "pkg:golang/golang.org/x/crypto@"+test.version {
+			purlVersion := test.version
+			if test.purlVersion != "" {
+				purlVersion = test.purlVersion
+			}
+			if info.Package.PURL != "pkg:golang/golang.org/x/crypto@"+purlVersion {
 				t.Fatalf("purl = %q", info.Package.PURL)
 			}
 			if info.Kind != "metadata" || !info.NeedsDecision || info.Cacheable != test.cacheable || !info.SkipVulnerabilityCheck {

@@ -109,13 +109,13 @@ func TestServerAppliesPolicyToGoModuleMetadata(t *testing.T) {
 		PathPrefix:  "/go/",
 		UpstreamURL: upstream.URL + "/",
 	}}
-	engine, err := policy.New(policy.Config{Deny: []string{"pkg:golang/golang.org/x/crypto@v0.0.0-20210220033148-5ea612d1eb83"}})
+	engine, err := policy.New(policy.Config{Deny: []string{"pkg:golang/golang.org/x/crypto@v1.2.3-RC1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	provider := &criticalIntelProvider{}
 	recorder := httptest.NewRecorder()
-	New(cfg, engine, provider).routesHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/go/golang.org/x/crypto/@v/v0.0.0-20210220033148-5ea612d1eb83.mod", nil))
+	New(cfg, engine, provider).routesHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/go/golang.org/x/crypto/@v/v1.2.3-!r!c1.mod", nil))
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}

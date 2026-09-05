@@ -20,16 +20,17 @@ import (
 const cacheStatusHeader = "X-Package-Firewall-Cache"
 
 type RunConfig struct {
-	BaseURL           string
-	RoutePrefix       string
-	PluginRoutePrefix string
-	Concurrency       int
-	RateLimitRetries  int
-	StateFile         string
-	HTTPClient        *http.Client
-	BearerToken       string
-	BasicUsername     string
-	BasicPassword     string
+	BaseURL            string
+	RoutePrefix        string
+	PluginRoutePrefix  string
+	Concurrency        int
+	MinRequestInterval time.Duration
+	RateLimitRetries   int
+	StateFile          string
+	HTTPClient         *http.Client
+	BearerToken        string
+	BasicUsername      string
+	BasicPassword      string
 }
 
 type PassStats struct {
@@ -96,8 +97,11 @@ func normalizeRunConfig(cfg RunConfig) (RunConfig, error) {
 	if cfg.Concurrency < 1 || cfg.Concurrency > 16 {
 		return RunConfig{}, errors.New("prewarm concurrency must be between 1 and 16")
 	}
+	if cfg.MinRequestInterval < 0 {
+		return RunConfig{}, errors.New("prewarm minimum request interval must not be negative")
+	}
 	if cfg.RateLimitRetries == 0 {
-		cfg.RateLimitRetries = 8
+		cfg.RateLimitRetries = 1
 	}
 	if cfg.RateLimitRetries < 1 || cfg.RateLimitRetries > 16 {
 		return RunConfig{}, errors.New("prewarm rate-limit retries must be between 1 and 16")
@@ -165,6 +169,34 @@ type artifactJob struct {
 	artifact Artifact
 }
 
+type requestPacer struct {
+	minInterval time.Duration
+	mu          sync.Mutex
+	next        time.Time
+}
+
+func newRequestPacer(minInterval time.Duration) *requestPacer {
+	if minInterval == 0 {
+		return nil
+	}
+	return &requestPacer{minInterval: minInterval}
+}
+
+func (p *requestPacer) do(ctx context.Context, client *http.Client, request *http.Request) (*http.Response, error) {
+	if p == nil {
+		return client.Do(request)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if delay := time.Until(p.next); delay > 0 {
+		if err := waitContext(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+	p.next = time.Now().Add(p.minInterval)
+	return client.Do(request)
+}
+
 func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, selectedRoutes []string, requireHit bool, checkpoint *checkpoint) (PassStats, []string, error) {
 	if selectedRoutes != nil && len(selectedRoutes) != len(artifacts) {
 		return PassStats{}, nil, errors.New("selected prewarm routes do not match artifact manifest")
@@ -178,6 +210,10 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 	var errOnce sync.Once
 	var unavailable []Artifact
 	var unavailableMu sync.Mutex
+	pacer := newRequestPacer(0)
+	if !requireHit {
+		pacer = newRequestPacer(cfg.MinRequestInterval)
+	}
 	fail := func(err error) {
 		errOnce.Do(func() {
 			firstErr = err
@@ -215,7 +251,7 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 					if selectedRoutes != nil {
 						routes = []string{selectedRoutes[job.index]}
 					}
-					status, route, found, err = fetchArtifact(ctx, cfg, job.artifact, routes)
+					status, route, found, err = fetchArtifact(ctx, cfg, pacer, job.artifact, routes)
 					if err == nil {
 						break
 					}
@@ -299,9 +335,9 @@ func routeCandidates(cfg RunConfig, artifact Artifact) []string {
 	return []string{cfg.RoutePrefix}
 }
 
-func fetchArtifact(ctx context.Context, cfg RunConfig, artifact Artifact, routes []string) (string, string, bool, error) {
+func fetchArtifact(ctx context.Context, cfg RunConfig, pacer *requestPacer, artifact Artifact, routes []string) (string, string, bool, error) {
 	for _, route := range routes {
-		status, found, err := fetchArtifactFromRoute(ctx, cfg, artifact, route)
+		status, found, err := fetchArtifactFromRoute(ctx, cfg, pacer, artifact, route)
 		if err != nil {
 			return "", "", false, err
 		}
@@ -340,7 +376,7 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifact, route string) (string, bool, error) {
+func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPacer, artifact Artifact, route string) (string, bool, error) {
 	target, err := url.JoinPath(cfg.BaseURL, route, artifact.Path)
 	if err != nil {
 		return "", false, fmt.Errorf("build request URL: %w", err)
@@ -355,7 +391,7 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifac
 	} else if cfg.BasicUsername != "" {
 		request.SetBasicAuth(cfg.BasicUsername, cfg.BasicPassword)
 	}
-	response, err := cfg.HTTPClient.Do(request)
+	response, err := pacer.do(ctx, cfg.HTTPClient, request)
 	if err != nil {
 		return "", false, fmt.Errorf("request package firewall: %w", err)
 	}

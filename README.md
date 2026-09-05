@@ -122,7 +122,9 @@ go run ./cmd/pfw prewarm \
 ```
 
 For a bounded, resumable run, add `--state-file` and keep the file between
-runs. `--rate-limit-retries` bounds retries after upstream `429` responses.
+runs. `--min-request-interval` spaces first-pass requests across all workers,
+and `--rate-limit-retries` bounds delayed retries after upstream `429`
+responses (one retry by default).
 
 `--exclude-coordinate` is repeatable and accepts only a complete locked
 `group:name:version`. Use it only for a dependency that the Gradle build keeps

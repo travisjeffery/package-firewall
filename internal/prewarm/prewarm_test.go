@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -114,6 +116,85 @@ func TestRunRetriesRateLimitedArtifact(t *testing.T) {
 	defer mu.Unlock()
 	if requests != 3 {
 		t.Fatalf("requests = %d want 3", requests)
+	}
+}
+
+func TestRunPassPacesFirstPassAcrossWorkers(t *testing.T) {
+	const artifactCount = 4
+	const interval = 50 * time.Millisecond
+	var mu sync.Mutex
+	var starts []time.Time
+	var first atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/maven/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		if first.CompareAndSwap(false, true) {
+			time.Sleep(3 * interval)
+		}
+		w.Header().Set(cacheStatusHeader, "MISS")
+		_, _ = io.WriteString(w, "artifact")
+	}))
+	defer server.Close()
+
+	artifacts := make([]Artifact, 0, artifactCount)
+	for index := range artifactCount {
+		artifacts = append(artifacts, Artifact{
+			Path:   fmt.Sprintf("org/example/library/%d/library-%d.jar", index, index),
+			SHA256: []string{sum("artifact")},
+		})
+	}
+	config, err := normalizeRunConfig(RunConfig{
+		BaseURL:            server.URL,
+		Concurrency:        artifactCount,
+		MinRequestInterval: interval,
+		HTTPClient:         server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runPass(context.Background(), config, artifacts, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(starts) != artifactCount {
+		t.Fatalf("request count = %d want %d", len(starts), artifactCount)
+	}
+	sort.Slice(starts, func(left, right int) bool { return starts[left].Before(starts[right]) })
+	minimum := 3*interval - 10*time.Millisecond
+	for index := 1; index < len(starts); index++ {
+		if index > 1 {
+			minimum = interval - 10*time.Millisecond
+		}
+		if spacing := starts[index].Sub(starts[index-1]); spacing < minimum {
+			t.Fatalf("request spacing = %s want at least %s", spacing, minimum)
+		}
+	}
+}
+
+func TestRunRejectsNegativeMinRequestInterval(t *testing.T) {
+	err := Run(context.Background(), RunConfig{
+		BaseURL:            "https://packages.example",
+		MinRequestInterval: -time.Second,
+	}, []Artifact{{Path: "artifact", SHA256: []string{sum("artifact")}}}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "minimum request interval") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestNormalizeDefaultsToOneRateLimitRetry(t *testing.T) {
+	config, err := normalizeRunConfig(RunConfig{BaseURL: "https://packages.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.RateLimitRetries != 1 {
+		t.Fatalf("rate-limit retries = %d want 1", config.RateLimitRetries)
 	}
 }
 

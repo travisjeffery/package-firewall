@@ -124,10 +124,18 @@ func TestRunPassPacesFirstPassAcrossWorkers(t *testing.T) {
 	const interval = 50 * time.Millisecond
 	var mu sync.Mutex
 	var starts []time.Time
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var first atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/maven/") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		mu.Lock()
 		starts = append(starts, time.Now())
 		mu.Unlock()
+		if first.CompareAndSwap(false, true) {
+			time.Sleep(3 * interval)
+		}
 		w.Header().Set(cacheStatusHeader, "MISS")
 		_, _ = io.WriteString(w, "artifact")
 	}))
@@ -159,8 +167,11 @@ func TestRunPassPacesFirstPassAcrossWorkers(t *testing.T) {
 		t.Fatalf("request count = %d want %d", len(starts), artifactCount)
 	}
 	sort.Slice(starts, func(left, right int) bool { return starts[left].Before(starts[right]) })
-	minimum := interval - 10*time.Millisecond
+	minimum := 3*interval - 10*time.Millisecond
 	for index := 1; index < len(starts); index++ {
+		if index > 1 {
+			minimum = interval - 10*time.Millisecond
+		}
 		if spacing := starts[index].Sub(starts[index-1]); spacing < minimum {
 			t.Fatalf("request spacing = %s want at least %s", spacing, minimum)
 		}

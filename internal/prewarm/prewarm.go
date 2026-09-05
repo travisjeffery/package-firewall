@@ -182,19 +182,19 @@ func newRequestPacer(minInterval time.Duration) *requestPacer {
 	return &requestPacer{minInterval: minInterval}
 }
 
-func (p *requestPacer) wait(ctx context.Context) error {
+func (p *requestPacer) do(ctx context.Context, client *http.Client, request *http.Request) (*http.Response, error) {
 	if p == nil {
-		return nil
+		return client.Do(request)
 	}
 	p.mu.Lock()
-	now := time.Now()
-	start := p.next
-	if start.Before(now) {
-		start = now
+	defer p.mu.Unlock()
+	if delay := time.Until(p.next); delay > 0 {
+		if err := waitContext(ctx, delay); err != nil {
+			return nil, err
+		}
 	}
-	p.next = start.Add(p.minInterval)
-	p.mu.Unlock()
-	return waitContext(ctx, time.Until(start))
+	p.next = time.Now().Add(p.minInterval)
+	return client.Do(request)
 }
 
 func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, selectedRoutes []string, requireHit bool, checkpoint *checkpoint) (PassStats, []string, error) {
@@ -251,10 +251,7 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 					if selectedRoutes != nil {
 						routes = []string{selectedRoutes[job.index]}
 					}
-					if err := pacer.wait(ctx); err != nil {
-						return
-					}
-					status, route, found, err = fetchArtifact(ctx, cfg, job.artifact, routes)
+					status, route, found, err = fetchArtifact(ctx, cfg, pacer, job.artifact, routes)
 					if err == nil {
 						break
 					}
@@ -338,9 +335,9 @@ func routeCandidates(cfg RunConfig, artifact Artifact) []string {
 	return []string{cfg.RoutePrefix}
 }
 
-func fetchArtifact(ctx context.Context, cfg RunConfig, artifact Artifact, routes []string) (string, string, bool, error) {
+func fetchArtifact(ctx context.Context, cfg RunConfig, pacer *requestPacer, artifact Artifact, routes []string) (string, string, bool, error) {
 	for _, route := range routes {
-		status, found, err := fetchArtifactFromRoute(ctx, cfg, artifact, route)
+		status, found, err := fetchArtifactFromRoute(ctx, cfg, pacer, artifact, route)
 		if err != nil {
 			return "", "", false, err
 		}
@@ -379,7 +376,7 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifact, route string) (string, bool, error) {
+func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPacer, artifact Artifact, route string) (string, bool, error) {
 	target, err := url.JoinPath(cfg.BaseURL, route, artifact.Path)
 	if err != nil {
 		return "", false, fmt.Errorf("build request URL: %w", err)
@@ -394,7 +391,7 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, artifact Artifac
 	} else if cfg.BasicUsername != "" {
 		request.SetBasicAuth(cfg.BasicUsername, cfg.BasicPassword)
 	}
-	response, err := cfg.HTTPClient.Do(request)
+	response, err := pacer.do(ctx, cfg.HTTPClient, request)
 	if err != nil {
 		return "", false, fmt.Errorf("request package firewall: %w", err)
 	}

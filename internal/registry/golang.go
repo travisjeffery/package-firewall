@@ -21,13 +21,13 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 		version = strings.TrimSuffix(file, ".info")
 		info.Kind = "metadata"
 		info.NeedsDecision = true
-		info.Cacheable = module.CanonicalVersion(version) == version
+		info.Cacheable = isCanonicalGoModuleVersion(version)
 		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".mod"):
 		version = strings.TrimSuffix(file, ".mod")
 		info.Kind = "metadata"
 		info.NeedsDecision = true
-		info.Cacheable = module.CanonicalVersion(version) == version
+		info.Cacheable = isCanonicalGoModuleVersion(version)
 		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".zip"):
 		version = strings.TrimSuffix(file, ".zip")
@@ -43,6 +43,11 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 		PURL:      purl("go", moduleName, version),
 	}
 	return info
+}
+
+func isCanonicalGoModuleVersion(version string) bool {
+	unescapedVersion, err := module.UnescapeVersion(version)
+	return err == nil && module.CanonicalVersion(unescapedVersion) == unescapedVersion
 }
 
 func unescapeGoModule(module string) string {

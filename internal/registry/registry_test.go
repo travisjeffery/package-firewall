@@ -88,6 +88,7 @@ func TestIdentifyGoModuleMetadata(t *testing.T) {
 		{name: "canonical pseudo version info", version: "v0.0.0-20210220033148-5ea612d1eb83", extension: "info", cacheable: true},
 		{name: "canonical release mod", version: "v0.30.0", extension: "mod", cacheable: true},
 		{name: "canonical incompatible release info", version: "v2.0.0+incompatible", extension: "info", cacheable: true},
+		{name: "escaped canonical prerelease mod", version: "v1.2.3-!r!c1", extension: "mod", cacheable: true},
 		{name: "branch info", version: "master", extension: "info", cacheable: false},
 		{name: "version prefix mod", version: "v1.2", extension: "mod", cacheable: false},
 	}

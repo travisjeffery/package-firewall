@@ -197,6 +197,9 @@ func (s *Server) decide(ctx context.Context, info registry.RequestInfo) policy.D
 		}
 		return policy.Decision{Action: policy.ActionBlock, Reason: "unknown package blocked by fail_open_unknown_package=false"}
 	}
+	if info.SkipVulnerabilityCheck {
+		return policy.Decision{Action: policy.ActionAllow, Reason: "metadata request allowed after policy evaluation"}
+	}
 	result, err := s.intel.Query(ctx, info.Package)
 	if err != nil {
 		if s.cfg.Decision.FailOpenIntelErrors {

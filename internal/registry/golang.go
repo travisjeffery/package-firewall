@@ -18,15 +18,21 @@ func identifyGo(route Route, relative string, info RequestInfo) RequestInfo {
 	switch {
 	case strings.HasSuffix(file, ".info"):
 		version = strings.TrimSuffix(file, ".info")
+		info.Kind = "metadata"
+		info.NeedsDecision = true
+		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".mod"):
 		version = strings.TrimSuffix(file, ".mod")
+		info.Kind = "metadata"
+		info.NeedsDecision = true
+		info.SkipVulnerabilityCheck = true
 	case strings.HasSuffix(file, ".zip"):
 		version = strings.TrimSuffix(file, ".zip")
+		info.Kind = "artifact"
+		info.NeedsDecision = true
 	default:
 		return info
 	}
-	info.Kind = "artifact"
-	info.NeedsDecision = true
 	info.Package = policy.Package{
 		Ecosystem: route.Ecosystem,
 		Name:      module,

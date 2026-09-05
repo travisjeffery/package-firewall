@@ -73,4 +73,21 @@ func TestIdentifyGoModule(t *testing.T) {
 	if info.Package.PURL != "pkg:golang/golang.org/x/mod@v0.30.0" {
 		t.Fatalf("purl = %q", info.Package.PURL)
 	}
+	if !info.NeedsDecision || info.SkipVulnerabilityCheck {
+		t.Fatalf("decision fields = (%v, %v)", info.NeedsDecision, info.SkipVulnerabilityCheck)
+	}
+}
+
+func TestIdentifyGoModuleMetadata(t *testing.T) {
+	for _, extension := range []string{"info", "mod"} {
+		t.Run(extension, func(t *testing.T) {
+			info := Identify(Route{Ecosystem: "go", PathPrefix: "/go/"}, "/go/golang.org/x/crypto/@v/v0.0.0-20210220033148-5ea612d1eb83."+extension)
+			if info.Package.PURL != "pkg:golang/golang.org/x/crypto@v0.0.0-20210220033148-5ea612d1eb83" {
+				t.Fatalf("purl = %q", info.Package.PURL)
+			}
+			if info.Kind != "metadata" || !info.NeedsDecision || !info.SkipVulnerabilityCheck {
+				t.Fatalf("info = %#v", info)
+			}
+		})
+	}
 }

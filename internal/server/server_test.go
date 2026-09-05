@@ -49,6 +49,81 @@ func TestServerBlocksDeniedArtifactBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestServerSkipsIntelForGoModuleMetadataButBlocksArchive(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Routes = []config.RouteConfig{{
+		Name:        "go",
+		Ecosystem:   "go",
+		PathPrefix:  "/go/",
+		UpstreamURL: upstream.URL + "/",
+	}}
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &criticalIntelProvider{}
+	server := New(cfg, engine, provider).routesHandler()
+
+	for _, extension := range []string{"info", "mod"} {
+		t.Run(extension, func(t *testing.T) {
+			metadata := httptest.NewRecorder()
+			server.ServeHTTP(metadata, httptest.NewRequest(http.MethodGet, "/go/golang.org/x/crypto/@v/v0.0.0-20210220033148-5ea612d1eb83."+extension, nil))
+			if metadata.Code != http.StatusOK {
+				t.Fatalf("metadata status = %d body = %s", metadata.Code, metadata.Body.String())
+			}
+		})
+	}
+	if provider.calls != 0 || upstreamHits != 2 {
+		t.Fatalf("metadata reached intel/upstream = %d/%d", provider.calls, upstreamHits)
+	}
+
+	archive := httptest.NewRecorder()
+	server.ServeHTTP(archive, httptest.NewRequest(http.MethodGet, "/go/golang.org/x/crypto/@v/v0.0.0-20210220033148-5ea612d1eb83.zip", nil))
+	if archive.Code != http.StatusForbidden {
+		t.Fatalf("archive status = %d body = %s", archive.Code, archive.Body.String())
+	}
+	if provider.calls != 1 || upstreamHits != 2 {
+		t.Fatalf("archive reached intel/upstream = %d/%d", provider.calls, upstreamHits)
+	}
+}
+
+func TestServerAppliesPolicyToGoModuleMetadata(t *testing.T) {
+	upstreamHit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Routes = []config.RouteConfig{{
+		Name:        "go",
+		Ecosystem:   "go",
+		PathPrefix:  "/go/",
+		UpstreamURL: upstream.URL + "/",
+	}}
+	engine, err := policy.New(policy.Config{Deny: []string{"pkg:golang/golang.org/x/crypto@v0.0.0-20210220033148-5ea612d1eb83"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &criticalIntelProvider{}
+	recorder := httptest.NewRecorder()
+	New(cfg, engine, provider).routesHandler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/go/golang.org/x/crypto/@v/v0.0.0-20210220033148-5ea612d1eb83.mod", nil))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+	if provider.calls != 0 || upstreamHit {
+		t.Fatalf("blocked metadata reached intel/upstream = %d/%v", provider.calls, upstreamHit)
+	}
+}
+
 func TestServerClearsUpstreamHeadersBeforeGatewayError(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.PublicBaseURL = "http://firewall.test"
@@ -342,6 +417,15 @@ func assertGatewayError(t *testing.T, recorder *httptest.ResponseRecorder, wantS
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+type criticalIntelProvider struct {
+	calls int
+}
+
+func (p *criticalIntelProvider) Query(context.Context, policy.Package) (intel.Result, error) {
+	p.calls++
+	return intel.Result{Findings: []intel.Finding{{ID: "GO-TEST", Severity: 10}}}, nil
+}
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)

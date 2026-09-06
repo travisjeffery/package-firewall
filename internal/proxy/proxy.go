@@ -263,13 +263,16 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 	}
+	requestedAt := p.now()
 	resp, err := p.do(req, route)
 	if err != nil {
 		return Result{}, err
 	}
 	defer resp.Body.Close()
+	receivedAt := p.now()
+	var npmExpiresAt time.Time
 	if cacheKey != "" {
-		p.stripCacheableNPMCDNCookies(resp, route, target)
+		npmExpiresAt = p.prepareNPMCacheResponse(resp, route, target, requestedAt, receivedAt)
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	if p.shouldRewrite(route, resp) {
@@ -287,9 +290,9 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 		return Result{StatusCode: resp.StatusCode}, err
 	}
 	if cacheKey != "" {
-		if responseReason := p.responseBypassReason(resp, target); responseReason == "" {
+		if responseReason := p.responseBypassReason(resp, target, !npmExpiresAt.IsZero()); responseReason == "" {
 			storeOwnsCompletion = true
-			return p.serveAndStore(w, route, resp, cacheKey, complete)
+			return p.serveAndStore(w, route, resp, cacheKey, receivedAt, npmExpiresAt, complete)
 		} else {
 			p.cache.Metrics.Bypass(route.Name, responseReason)
 		}
@@ -330,7 +333,7 @@ func (p *Proxy) cacheKey(r *http.Request, route config.RouteConfig, info registr
 	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target), ""
 }
 
-func (p *Proxy) responseBypassReason(resp *http.Response, target string) string {
+func (p *Proxy) responseBypassReason(resp *http.Response, target string, freshNPM bool) string {
 	if resp.StatusCode != http.StatusOK {
 		return "upstream_status"
 	}
@@ -352,7 +355,7 @@ func (p *Proxy) responseBypassReason(resp *http.Response, target string) string 
 	if resp.Uncompressed {
 		return "response_encoding"
 	}
-	if responseDisablesCaching(resp.Header) {
+	if responseDisablesCaching(resp.Header, freshNPM) {
 		return "response_cache_control"
 	}
 	if resp.ContentLength > p.cache.MaxObjectSize {
@@ -416,6 +419,9 @@ func (p *Proxy) loadCached(r *http.Request, key string) (*stagedEntry, error) {
 	if _, err := temporary.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
+	if entry.Expired(p.now()) {
+		return nil, artifactcache.ErrNotFound
+	}
 	cleanup = false
 	return staged, nil
 }
@@ -455,7 +461,7 @@ func agedHeaders(headers http.Header, storedAt, now time.Time) http.Header {
 	return aged
 }
 
-func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, resp *http.Response, key string, complete func()) (Result, error) {
+func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, resp *http.Response, key string, receivedAt, npmExpiresAt time.Time, complete func()) (Result, error) {
 	storeOwnsCompletion := false
 	defer func() {
 		if !storeOwnsCompletion {
@@ -496,6 +502,17 @@ func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, r
 	}
 	storedAt := p.now()
 	headers := artifactcache.SafeHeaders(resp.Header)
+	expiresAt := storedAt.Add(p.cache.ArtifactTTL)
+	if !npmExpiresAt.IsZero() {
+		if !npmExpiresAt.After(storedAt) {
+			p.cache.Metrics.Bypass(route.Name, "response_cache_control")
+			return Result{StatusCode: resp.StatusCode}, nil
+		}
+		if npmExpiresAt.Before(expiresAt) {
+			expiresAt = npmExpiresAt
+		}
+		headers = agedHeaders(headers, receivedAt, storedAt)
+	}
 	if headers.Get("Date") == "" {
 		headers.Set("Date", storedAt.UTC().Format(http.TimeFormat))
 	}
@@ -505,7 +522,7 @@ func (p *Proxy) serveAndStore(w http.ResponseWriter, route config.RouteConfig, r
 		SHA256:    spool.checksum(),
 		Size:      spool.size,
 		StoredAt:  storedAt,
-		ExpiresAt: storedAt.Add(p.cache.ArtifactTTL),
+		ExpiresAt: expiresAt,
 	}
 	temporaryPath := temporary.Name()
 	cleanup = false
@@ -682,8 +699,9 @@ func requestDisablesCaching(headers http.Header) bool {
 		strings.TrimSpace(headers.Get("Pragma")) != ""
 }
 
-func responseDisablesCaching(headers http.Header) bool {
-	return hasCacheDirective(headers.Values("Cache-Control"), "no-cache", "no-store", "private", "max-age=0", "s-maxage=0", "must-revalidate", "proxy-revalidate") ||
+func responseDisablesCaching(headers http.Header, freshNPM bool) bool {
+	return hasCacheDirective(headers.Values("Cache-Control"), "no-cache", "no-store", "private", "max-age=0", "s-maxage=0") ||
+		(!freshNPM && hasCacheDirective(headers.Values("Cache-Control"), "must-revalidate", "proxy-revalidate")) ||
 		strings.EqualFold(strings.TrimSpace(headers.Get("Pragma")), "no-cache")
 }
 

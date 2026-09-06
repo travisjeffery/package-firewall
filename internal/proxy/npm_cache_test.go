@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/travisjeffery/package-firewall/internal/config"
 	"github.com/travisjeffery/package-firewall/internal/registry"
@@ -118,8 +119,23 @@ func TestProxyPreservesNPMCookieCacheSafetyGates(t *testing.T) {
 		{name: "not public", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
 			resp.Header.Set("Cache-Control", "immutable, max-age=3600")
 		}},
-		{name: "not immutable", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
-			resp.Header.Set("Cache-Control", "public, max-age=3600")
+		{name: "missing freshness", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Cache-Control", "public, immutable")
+		}},
+		{name: "already stale", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Age", "31557600")
+		}},
+		{name: "malformed age", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Age", "invalid")
+		}},
+		{name: "duplicate age", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header["Age"] = []string{"1", "2"}
+		}},
+		{name: "malformed date", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Date", "invalid")
+		}},
+		{name: "stale date", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Date", time.Unix(1, 0).UTC().Format(http.TimeFormat))
 		}},
 		{name: "invalid public directive", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
 			resp.Header.Set("Cache-Control", "public=false, immutable")
@@ -198,7 +214,7 @@ func TestProxyDoesNotStripCDNCookiesAfterRedirect(t *testing.T) {
 	target := "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
 	request := &http.Request{URL: &url.URL{Scheme: "https", Host: "registry.npmjs.org", Path: "/other"}}
 	response := npmCookieResponse(request, []string{"__cf_bm=bot"})
-	proxy.stripCacheableNPMCDNCookies(response, testNPMRoute("https://registry.npmjs.org"), target)
+	proxy.prepareNPMCacheResponse(response, testNPMRoute("https://registry.npmjs.org"), target, proxy.now(), proxy.now())
 	if len(response.Cookies()) != 1 {
 		t.Fatal("redirected response cookies were stripped")
 	}
@@ -212,7 +228,7 @@ func TestProxyDoesNotStripCDNCookiesFromAuthenticatedUpstreamResponses(t *testin
 			request := httptest.NewRequest(http.MethodGet, target, nil)
 			request.Header.Set(header, "private")
 			response := npmCookieResponse(request, []string{"__cf_bm=bot"})
-			proxy.stripCacheableNPMCDNCookies(response, testNPMRoute("https://registry.npmjs.org"), target)
+			proxy.prepareNPMCacheResponse(response, testNPMRoute("https://registry.npmjs.org"), target, proxy.now(), proxy.now())
 			if len(response.Cookies()) != 1 {
 				t.Fatal("authenticated response cookies were stripped")
 			}

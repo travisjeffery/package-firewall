@@ -268,6 +268,9 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 		return Result{}, err
 	}
 	defer resp.Body.Close()
+	if cacheKey != "" {
+		p.stripCacheableNPMCDNCookies(resp, route, target)
+	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	if p.shouldRewrite(route, resp) {
 		if cacheKey != "" {
@@ -337,7 +340,7 @@ func (p *Proxy) responseBypassReason(resp *http.Response, target string) string 
 	if resp.Header.Get("Vary") != "" {
 		return "response_vary"
 	}
-	if resp.Header.Get("Set-Cookie") != "" {
+	if len(resp.Header.Values("Set-Cookie")) != 0 {
 		return "response_set_cookie"
 	}
 	if resp.Header.Get("Content-Range") != "" {

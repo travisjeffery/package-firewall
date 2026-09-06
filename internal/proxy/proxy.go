@@ -268,6 +268,9 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 		return Result{}, err
 	}
 	defer resp.Body.Close()
+	if cacheKey != "" {
+		p.stripCacheableNPMCDNCookies(resp, route, target)
+	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	if p.shouldRewrite(route, resp) {
 		if cacheKey != "" {
@@ -331,13 +334,13 @@ func (p *Proxy) responseBypassReason(resp *http.Response, target string) string 
 	if resp.StatusCode != http.StatusOK {
 		return "upstream_status"
 	}
-	if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.String() != target {
+	if resp.Request != nil && (resp.Request.Context().Value(upstreamRedirectedKey{}) == true || (resp.Request.URL != nil && resp.Request.URL.String() != target)) {
 		return "upstream_redirect"
 	}
 	if resp.Header.Get("Vary") != "" {
 		return "response_vary"
 	}
-	if resp.Header.Get("Set-Cookie") != "" {
+	if len(resp.Header.Values("Set-Cookie")) != 0 {
 		return "response_set_cookie"
 	}
 	if resp.Header.Get("Content-Range") != "" {
@@ -720,6 +723,8 @@ func representationVaries(headers http.Header) bool {
 	return false
 }
 
+type upstreamRedirectedKey struct{}
+
 func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.Response, error) {
 	checkRedirect, err := upstreamRedirectPolicy(
 		route.EnforceRedirectOrigins,
@@ -739,7 +744,9 @@ func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.R
 	}
 	client := *p.client
 	configuredCheck := client.CheckRedirect
+	redirected := false
 	client.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		redirected = true
 		if err := checkRedirect(request, via); err != nil {
 			return err
 		}
@@ -760,6 +767,9 @@ func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.R
 	if err := validateReturnedRedirect(request, response, checkRedirect); err != nil {
 		_ = response.Body.Close()
 		return nil, err
+	}
+	if redirected && response.Request != nil {
+		response.Request = response.Request.WithContext(context.WithValue(response.Request.Context(), upstreamRedirectedKey{}, true))
 	}
 	return response, nil
 }

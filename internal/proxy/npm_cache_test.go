@@ -14,41 +14,45 @@ import (
 )
 
 func TestProxyCachesPublicNPMArtifactsWithCDNCookies(t *testing.T) {
-	for _, cookies := range [][]string{
-		{"__cf_bm=bot; Path=/; HttpOnly; Secure; SameSite=None"},
-		{"_cfuvid=visitor; Path=/; HttpOnly; Secure; SameSite=None"},
-		{"__cf_bm=bot; Path=/; HttpOnly; Secure", "_cfuvid=visitor; Path=/; HttpOnly; Secure"},
-	} {
-		t.Run(strings.Join(cookies, ","), func(t *testing.T) {
-			store := newMemoryArtifactStore()
-			metrics := newTestCacheMetrics()
-			upstreamCalls := 0
-			transport := npmCookieTransport(func(request *http.Request) (*http.Response, error) {
-				upstreamCalls++
-				return npmCookieResponse(request, cookies), nil
-			})
-			for _, want := range []string{"MISS", "HIT"} {
-				proxy := newTestCachingProxy(t, store, metrics, 1024)
-				proxy.client = &http.Client{Transport: transport}
-				recorder := httptest.NewRecorder()
-				_, err := proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil), testNPMRoute("https://registry.npmjs.org"), exactArtifactInfo())
-				if err != nil {
-					t.Fatal(err)
-				}
-				if recorder.Code != http.StatusOK || recorder.Body.String() != "artifact" || recorder.Header().Get(cacheHeader) != want {
-					t.Fatalf("response = %d %q %q, want 200 artifact %s", recorder.Code, recorder.Body.String(), recorder.Header().Get(cacheHeader), want)
-				}
-				if len(recorder.Header().Values("Set-Cookie")) != 0 {
-					t.Fatal("CDN cookies were forwarded to the client")
-				}
-			}
-			if upstreamCalls != 1 || store.putCalls != 1 || metrics.hits["npm"] != 1 || len(metrics.bypasses) != 0 {
-				t.Fatalf("upstream=%d stores=%d hits=%v bypasses=%v", upstreamCalls, store.putCalls, metrics.hits, metrics.bypasses)
-			}
-			for _, entry := range store.entries {
-				if len(entry.headers.Values("Set-Cookie")) != 0 {
-					t.Fatal("CDN cookies were stored")
-				}
+	for _, upstream := range []string{"https://registry.npmjs.org", "https://REGISTRY.NPMJS.ORG", "HTTPS://registry.npmjs.org", "https://registry.npmjs.org:443"} {
+		t.Run(upstream, func(t *testing.T) {
+			for _, cookies := range [][]string{
+				{"__cf_bm=bot; Path=/; HttpOnly; Secure; SameSite=None"},
+				{"_cfuvid=visitor; Path=/; HttpOnly; Secure; SameSite=None"},
+				{"__cf_bm=bot; Path=/; HttpOnly; Secure", "_cfuvid=visitor; Path=/; HttpOnly; Secure"},
+			} {
+				t.Run(strings.Join(cookies, ","), func(t *testing.T) {
+					store := newMemoryArtifactStore()
+					metrics := newTestCacheMetrics()
+					upstreamCalls := 0
+					transport := npmCookieTransport(func(request *http.Request) (*http.Response, error) {
+						upstreamCalls++
+						return npmCookieResponse(request, cookies), nil
+					})
+					for _, want := range []string{"MISS", "HIT"} {
+						proxy := newTestCachingProxy(t, store, metrics, 1024)
+						proxy.client = &http.Client{Transport: transport}
+						recorder := httptest.NewRecorder()
+						_, err := proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil), testNPMRoute(upstream), exactArtifactInfo())
+						if err != nil {
+							t.Fatal(err)
+						}
+						if recorder.Code != http.StatusOK || recorder.Body.String() != "artifact" || recorder.Header().Get(cacheHeader) != want {
+							t.Fatalf("response = %d %q %q, want 200 artifact %s", recorder.Code, recorder.Body.String(), recorder.Header().Get(cacheHeader), want)
+						}
+						if len(recorder.Header().Values("Set-Cookie")) != 0 {
+							t.Fatal("CDN cookies were forwarded to the client")
+						}
+					}
+					if upstreamCalls != 1 || store.putCalls != 1 || metrics.hits["npm"] != 1 || len(metrics.bypasses) != 0 {
+						t.Fatalf("upstream=%d stores=%d hits=%v bypasses=%v", upstreamCalls, store.putCalls, metrics.hits, metrics.bypasses)
+					}
+					for _, entry := range store.entries {
+						if len(entry.headers.Values("Set-Cookie")) != 0 {
+							t.Fatal("CDN cookies were stored")
+						}
+					}
+				})
 			}
 		})
 	}
@@ -61,6 +65,18 @@ func TestProxyPreservesNPMCookieCacheSafetyGates(t *testing.T) {
 		mutate   func(*http.Request, *http.Response, *config.RouteConfig, *registry.RequestInfo)
 	}{
 		{name: "insecure upstream", upstream: "http://registry.npmjs.org"},
+		{name: "quoted cache directives", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Cache-Control", `foo="x, public, immutable, y"`)
+		}},
+		{name: "folded cookies", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Set-Cookie", "__cf_bm=bot, session=private")
+		}},
+		{name: "malformed same site", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Set-Cookie", "__cf_bm=bot; SameSite=nonsense")
+		}},
+		{name: "rewritten artifact", mutate: func(_ *http.Request, resp *http.Response, _ *config.RouteConfig, _ *registry.RequestInfo) {
+			resp.Header.Set("Content-Type", "application/json")
+		}},
 		{name: "other registry", upstream: "https://registry.example.com"},
 		{name: "lookalike registry", upstream: "https://registry.npmjs.org.example.com"},
 		{name: "custom port", upstream: "https://registry.npmjs.org:8443"},
@@ -201,6 +217,67 @@ func TestProxyDoesNotStripCDNCookiesFromAuthenticatedUpstreamResponses(t *testin
 				t.Fatal("authenticated response cookies were stripped")
 			}
 		})
+	}
+}
+
+func TestValidNPMCDNCookie(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		valid bool
+	}{
+		{"__cf_bm=bot; expires=Sun, 06 Sep 2026 01:30:00 GMT; path=/; domain=.npmjs.org; HttpOnly; Secure; SameSite=None", true},
+		{"_cfuvid=visitor; Max-Age=3600; Path=/; SameSite=Lax; Partitioned; Secure", true},
+		{"__cf_bm=bot, session=private", false},
+		{"__cf_bm=bot; Path=/, session=private", false},
+		{"__cf_bm=bot; Secure=oops", false},
+		{"__cf_bm=bot; HttpOnly=oops", false},
+		{"__cf_bm=bot; Partitioned=oops", false},
+		{"__cf_bm=bot; SameSite=nonsense", false},
+		{"__cf_bm=bot; SameSite", false},
+		{"__cf_bm=bot; Domain=", false},
+		{"__cf_bm=bot; Expires=invalid", false},
+		{"__cf_bm=bot; Max-Age=invalid", false},
+		{"__cf_bm=bot; Unknown=value", false},
+		{"__cf_bm=bot;", false},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			if got := validNPMCDNCookie(test.value); got != test.valid {
+				t.Fatalf("valid = %v, want %v", got, test.valid)
+			}
+		})
+	}
+}
+
+func TestProxyDoesNotCacheRedirectBackToNPMArtifact(t *testing.T) {
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	requests := 0
+	proxy.client = &http.Client{Transport: npmCookieTransport(func(request *http.Request) (*http.Response, error) {
+		requests++
+		response := npmCookieResponse(request, []string{"__cf_bm=bot"})
+		if requests%3 != 0 {
+			response.StatusCode = http.StatusFound
+			location := "/bounce"
+			if requests%3 == 2 {
+				location = "/pkg/-/pkg-1.0.0.tgz"
+			}
+			response.Header.Set("Location", location)
+		}
+		return response, nil
+	})}
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		_, err := proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil), testNPMRoute("https://registry.npmjs.org"), exactArtifactInfo())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if recorder.Header().Get(cacheHeader) != "MISS" || recorder.Header().Get("Set-Cookie") != "__cf_bm=bot" {
+			t.Fatal("redirected response was cached or its cookies were stripped")
+		}
+	}
+	if store.putCalls != 0 || requests != 6 || metrics.bypasses[bypassMetricKey{route: "npm", reason: "upstream_redirect"}] != 2 {
+		t.Fatalf("stores=%d requests=%d bypasses=%v", store.putCalls, requests, metrics.bypasses)
 	}
 }
 

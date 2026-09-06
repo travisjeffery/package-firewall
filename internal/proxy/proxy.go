@@ -271,8 +271,9 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 	defer resp.Body.Close()
 	receivedAt := p.now()
 	var npmExpiresAt time.Time
+	var npmBypassReason string
 	if cacheKey != "" {
-		npmExpiresAt = p.prepareNPMCacheResponse(resp, route, target, requestedAt, receivedAt)
+		npmExpiresAt, npmBypassReason = p.prepareNPMCacheResponse(resp, route, target, requestedAt, receivedAt)
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	if p.shouldRewrite(route, resp) {
@@ -290,7 +291,11 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 		return Result{StatusCode: resp.StatusCode}, err
 	}
 	if cacheKey != "" {
-		if responseReason := p.responseBypassReason(resp, target, !npmExpiresAt.IsZero()); responseReason == "" {
+		responseReason := npmBypassReason
+		if responseReason == "" {
+			responseReason = p.responseBypassReason(resp, target, !npmExpiresAt.IsZero())
+		}
+		if responseReason == "" {
 			storeOwnsCompletion = true
 			return p.serveAndStore(w, route, resp, cacheKey, receivedAt, npmExpiresAt, complete)
 		} else {
@@ -329,6 +334,9 @@ func (p *Proxy) cacheKey(r *http.Request, route config.RouteConfig, info registr
 	}
 	if representationVaries(r.Header) {
 		return "", "representation"
+	}
+	if route.Ecosystem == "npm" {
+		return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target, "npm-freshness-v2"), ""
 	}
 	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target), ""
 }
@@ -700,9 +708,9 @@ func requestDisablesCaching(headers http.Header) bool {
 }
 
 func responseDisablesCaching(headers http.Header, freshNPM bool) bool {
-	return hasCacheDirective(headers.Values("Cache-Control"), "no-cache", "no-store", "private", "max-age=0", "s-maxage=0") ||
-		(!freshNPM && hasCacheDirective(headers.Values("Cache-Control"), "must-revalidate", "proxy-revalidate")) ||
-		strings.EqualFold(strings.TrimSpace(headers.Get("Pragma")), "no-cache")
+	return hasCacheDirective(headers.Values("Cache-Control"), "no-cache", "no-store", "private") ||
+		(!freshNPM && hasCacheDirective(headers.Values("Cache-Control"), "must-revalidate", "proxy-revalidate", "max-age=0", "s-maxage=0")) ||
+		hasCacheDirective(headers.Values("Pragma"), "no-cache")
 }
 
 func hasCacheDirective(values []string, directives ...string) bool {

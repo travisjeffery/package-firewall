@@ -10,62 +10,62 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/config"
 )
 
-func (p *Proxy) prepareNPMCacheResponse(resp *http.Response, route config.RouteConfig, target string, requestedAt, receivedAt time.Time) time.Time {
+func (p *Proxy) prepareNPMCacheResponse(resp *http.Response, route config.RouteConfig, target string, requestedAt, receivedAt time.Time) (time.Time, string) {
 	if route.Ecosystem != "npm" || route.UpstreamTokenEnv != "" || p.shouldRewrite(route, resp) {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	upstream, err := url.Parse(target)
 	if err != nil || upstream.User != nil || upstream.RawQuery != "" || upstream.ForceQuery {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	origin, err := config.NormalizeHTTPOrigin(upstream.Scheme + "://" + upstream.Host)
 	if err != nil || origin != "https://registry.npmjs.org:443" {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	if resp.Request == nil || resp.Request.Header.Get("Authorization") != "" || resp.Request.Header.Get("Cookie") != "" {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	lifetime, ok := npmFreshnessLifetime(resp.Header)
 	if !ok {
-		return time.Time{}
+		return time.Time{}, "response_cache_control"
 	}
 	for _, value := range resp.Header.Values("Set-Cookie") {
 		if !validNPMCDNCookie(value) {
-			return time.Time{}
+			return time.Time{}, "response_set_cookie"
 		}
 	}
 	if len(resp.Header.Values("Age")) > 1 || len(resp.Header.Values("Date")) > 1 {
-		return time.Time{}
+		return time.Time{}, "response_cache_control"
 	}
 	var age time.Duration
 	if values := resp.Header.Values("Age"); len(values) != 0 {
 		var valid bool
 		age, valid = npmDeltaSeconds(strings.TrimSpace(values[0]))
 		if !valid {
-			return time.Time{}
+			return time.Time{}, "response_cache_control"
 		}
 	}
 	age += max(receivedAt.Sub(requestedAt), 0)
 	if values := resp.Header.Values("Date"); len(values) != 0 {
 		date, err := http.ParseTime(values[0])
 		if err != nil {
-			return time.Time{}
+			return time.Time{}, "response_cache_control"
 		}
 		age = max(age, receivedAt.Sub(date))
 	}
 	if age >= lifetime {
-		return time.Time{}
+		return time.Time{}, "response_cache_control"
 	}
 	// CDN visitor cookies must never be persisted or replayed to another client.
 	candidate := *resp
 	candidate.Header = resp.Header.Clone()
 	candidate.Header.Del("Set-Cookie")
-	if p.responseBypassReason(&candidate, target, true) != "" {
-		return time.Time{}
+	if reason := p.responseBypassReason(&candidate, target, true); reason != "" {
+		return time.Time{}, reason
 	}
 	candidate.Header.Set("Age", strconv.FormatInt(int64(age/time.Second), 10))
 	resp.Header = candidate.Header
-	return receivedAt.Add(lifetime - age)
+	return receivedAt.Add(lifetime - age), ""
 }
 
 func npmFreshnessLifetime(headers http.Header) (time.Duration, bool) {

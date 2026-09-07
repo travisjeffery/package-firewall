@@ -215,7 +215,6 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 	if requireHit {
 		cfg.pass = 2
 	}
-	cfg.emit(progressEvent{Event: "pass_start"})
 	if selectedRoutes != nil && len(selectedRoutes) != len(artifacts) {
 		return PassStats{}, nil, errors.New("selected prewarm routes do not match artifact manifest")
 	}
@@ -223,6 +222,11 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 	defer cancel()
 	jobs := make(chan artifactJob)
 	var stats PassStats
+	passStarted := time.Now()
+	cfg.emit(progressEvent{Event: "pass_start"})
+	defer func() {
+		cfg.emit(progressEvent{Event: "pass_end", Completed: atomic.LoadInt64(&stats.Artifacts), ElapsedMS: time.Since(passStarted).Milliseconds()})
+	}()
 	discoveredRoutes := make([]string, len(artifacts))
 	var firstErr error
 	var errOnce sync.Once

@@ -75,8 +75,13 @@ func TestProgressReportsRequestPhasesAndVerifiedCompletion(t *testing.T) {
 			if event.Event == "artifact_complete" && (event.Completed != 1 || event.Total != 1 || event.CacheStatus != "HIT") {
 				t.Fatalf("bad completion: %+v", event)
 			}
+			if event.Event == "pass_end" {
+				if event.Requests != 1 || event.Retries != 0 || event.RetryWaitMS != 0 || event.Completed != 1 || event.HeadersMS < 10 || event.BodyMS < 10 || event.ElapsedMS < event.HeadersMS+event.BodyMS {
+					t.Fatalf("bad pass totals: %+v", event)
+				}
+			}
 		}
-		if strings.Join(phases, ",") != "pass_start,artifact_start,request_start,request_sent,request_headers,request_end,artifact_complete" {
+		if strings.Join(phases, ",") != "pass_start,artifact_start,request_start,request_sent,request_headers,request_end,artifact_complete,pass_end" {
 			t.Fatalf("phases = %v", phases)
 		}
 	}
@@ -96,21 +101,27 @@ func TestProgressReportsLongRetryBeforeWaitingAndHonorsCancellation(t *testing.T
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var retry progressEvent
+	var retry, passEnd progressEvent
 	writer := progressWriterFunc(func(p []byte) (int, error) {
 		var event progressEvent
 		if err := json.Unmarshal(p, &event); err != nil {
 			t.Error(err)
 		}
-		if event.Event == "retry_wait" {
+		switch event.Event {
+		case "retry_wait":
 			retry = event
 			cancel()
+		case "pass_end":
+			passEnd = event
 		}
 		return len(p), nil
 	})
 	err := Run(ctx, RunConfig{BaseURL: server.URL, Progress: writer}, []Artifact{{Path: "a.jar", SHA256: []string{sum("artifact")}}}, nil)
 	if !errors.Is(err, context.Canceled) || retry.RetryDelayMS != 1800000 || !retry.RetryAfter || retry.Attempt != 1 || calls.Load() != 1 {
 		t.Fatalf("error=%v retry=%+v calls=%d", err, retry, calls.Load())
+	}
+	if passEnd.Retries != 1 || passEnd.RetryWaitMS != 1800000 || passEnd.Completed != 0 {
+		t.Fatalf("pass totals did not attribute the upstream cooldown: %+v", passEnd)
 	}
 }
 

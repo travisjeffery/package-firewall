@@ -135,6 +135,12 @@ it came from `Retry-After` before sleeping, so a long upstream cooldown is visib
 Start, sent, and headers events identify the current phase even if a request is
 still blocked. Completion counts include resumed checkpoint entries; checkpoint
 entries are labeled separately from requests verified in this run.
+Each pass closes with a `pass_end` event totalling its requests, retries,
+cooldown wait, and pacing/header/body time, so a pass that spent most of its
+wall clock waiting on upstream `Retry-After` is visible without reprocessing the
+stream. `retry_wait_ms` totals the delays the run *planned* to wait, so a pass
+interrupted mid-cooldown reports more wait than it served. A pass killed
+outright emits no `pass_end`; use the per-artifact events for that case.
 Credentials, full URLs, response bodies, and unselected headers are not logged.
 Progress does not change pacing, timeout, retry, checksum, or second-pass HIT gates.
 

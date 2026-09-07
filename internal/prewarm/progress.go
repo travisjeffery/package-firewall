@@ -27,12 +27,28 @@ type progressEvent struct {
 	RetryDelayMS int64     `json:"retry_delay_ms,omitempty"`
 	RetryAfter   bool      `json:"retry_after,omitempty"`
 	Outcome      string    `json:"outcome,omitempty"`
+	Requests     int64     `json:"requests,omitempty"`
+	Retries      int64     `json:"retries,omitempty"`
+	RetryWaitMS  int64     `json:"retry_wait_ms,omitempty"`
+}
+
+// passTotals accumulates the per-request timings already reported for the
+// current pass so a pass_end event can attribute its wall clock without
+// re-reading the event stream.
+type passTotals struct {
+	requests    int64
+	retries     int64
+	retryWaitMS int64
+	pacingMS    int64
+	headersMS   int64
+	bodyMS      int64
 }
 
 type progressLogger struct {
 	mu      sync.Mutex
 	encoder *json.Encoder
 	err     error
+	totals  passTotals
 }
 
 func newProgressLogger(output io.Writer) *progressLogger {
@@ -50,6 +66,23 @@ func (cfg RunConfig) emit(event progressEvent) {
 	defer cfg.progress.mu.Unlock()
 	if cfg.progress.err != nil {
 		return
+	}
+	totals := &cfg.progress.totals
+	switch event.Event {
+	case "pass_start":
+		*totals = passTotals{}
+	case "request_end":
+		totals.requests++
+		totals.pacingMS += event.PacingMS
+		totals.headersMS += event.HeadersMS
+		totals.bodyMS += event.BodyMS
+	case "retry_wait":
+		totals.retries++
+		totals.retryWaitMS += event.RetryDelayMS
+	case "pass_end":
+		event.Requests, event.Retries = totals.requests, totals.retries
+		event.RetryWaitMS, event.PacingMS = totals.retryWaitMS, totals.pacingMS
+		event.HeadersMS, event.BodyMS = totals.headersMS, totals.bodyMS
 	}
 	event.Time = time.Now().UTC()
 	event.Pass, event.Total, event.Attempt = cfg.pass, cfg.total, cfg.attempt

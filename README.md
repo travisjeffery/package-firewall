@@ -126,6 +126,18 @@ runs. `--min-request-interval` spaces first-pass requests across all workers,
 and `--rate-limit-retries` bounds delayed retries after upstream `429`
 responses (one retry by default).
 
+The CLI streams JSON progress to stderr while keeping pass summaries on stdout.
+Each artifact reports its pass, path, attempt, selected route, HTTP/cache status,
+request ID, bytes, and elapsed time. Request events separate pacing/worker wait,
+time to response headers (including connection setup), and body reading/checksum
+time. A `retry_wait` event reports the planned delay in milliseconds and whether
+it came from `Retry-After` before sleeping, so a long upstream cooldown is visible.
+Start, sent, and headers events identify the current phase even if a request is
+still blocked. Completion counts include resumed checkpoint entries; checkpoint
+entries are labeled separately from requests verified in this run.
+Credentials, full URLs, response bodies, and unselected headers are not logged.
+Progress does not change pacing, timeout, retry, checksum, or second-pass HIT gates.
+
 `--exclude-coordinate` is repeatable and accepts only a complete locked
 `group:name:version`. Use it only for a dependency that the Gradle build keeps
 on an external vendor or private repository. This keeps repository routing

@@ -31,6 +31,11 @@ type RunConfig struct {
 	BearerToken        string
 	BasicUsername      string
 	BasicPassword      string
+	Progress           io.Writer
+	progress           *progressLogger
+	pass               int
+	total              int
+	attempt            int
 }
 
 type PassStats struct {
@@ -39,11 +44,17 @@ type PassStats struct {
 	Misses    int64
 }
 
-func Run(ctx context.Context, cfg RunConfig, artifacts []Artifact, output io.Writer) error {
+func Run(ctx context.Context, cfg RunConfig, artifacts []Artifact, output io.Writer) (runErr error) {
 	normalized, err := normalizeRunConfig(cfg)
 	if err != nil {
 		return err
 	}
+	normalized.progress = newProgressLogger(cfg.Progress)
+	defer func() {
+		if normalized.progress != nil && normalized.progress.err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("write prewarm progress: %w", normalized.progress.err))
+		}
+	}()
 	if len(artifacts) == 0 {
 		return errors.New("prewarm manifest contains no artifacts")
 	}
@@ -182,8 +193,9 @@ func newRequestPacer(minInterval time.Duration) *requestPacer {
 	return &requestPacer{minInterval: minInterval}
 }
 
-func (p *requestPacer) do(ctx context.Context, client *http.Client, request *http.Request) (*http.Response, error) {
+func (p *requestPacer) do(ctx context.Context, client *http.Client, request *http.Request, onStart func()) (*http.Response, error) {
 	if p == nil {
+		onStart()
 		return client.Do(request)
 	}
 	p.mu.Lock()
@@ -194,10 +206,16 @@ func (p *requestPacer) do(ctx context.Context, client *http.Client, request *htt
 		}
 	}
 	p.next = time.Now().Add(p.minInterval)
+	onStart()
 	return client.Do(request)
 }
 
 func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, selectedRoutes []string, requireHit bool, checkpoint *checkpoint) (PassStats, []string, error) {
+	cfg.pass, cfg.total = 1, len(artifacts)
+	if requireHit {
+		cfg.pass = 2
+	}
+	cfg.emit(progressEvent{Event: "pass_start"})
 	if selectedRoutes != nil && len(selectedRoutes) != len(artifacts) {
 		return PassStats{}, nil, errors.New("selected prewarm routes do not match artifact manifest")
 	}
@@ -226,6 +244,9 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 		go func() {
 			defer workers.Done()
 			for job := range jobs {
+				started := time.Now()
+				jobCfg := cfg
+				jobCfg.emit(progressEvent{Event: "artifact_start", Artifact: job.artifact.Path})
 				if checkpoint != nil {
 					if entry, ok := checkpoint.completed(job.artifact); ok {
 						discoveredRoutes[job.index] = entry.Route
@@ -239,6 +260,7 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 							fail(fmt.Errorf("%s: checkpoint has unexpected cache status %q", job.artifact.Path, entry.Status))
 							return
 						}
+						jobCfg.emit(progressEvent{Event: "artifact_complete", Artifact: job.artifact.Path, Route: entry.Route, CacheStatus: entry.Status, Outcome: "checkpoint", Completed: atomic.LoadInt64(&stats.Artifacts), ElapsedMS: time.Since(started).Milliseconds()})
 						continue
 					}
 				}
@@ -251,7 +273,8 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 					if selectedRoutes != nil {
 						routes = []string{selectedRoutes[job.index]}
 					}
-					status, route, found, err = fetchArtifact(ctx, cfg, pacer, job.artifact, routes)
+					jobCfg.attempt = rateLimitAttempts + 1
+					status, route, found, err = fetchArtifact(ctx, jobCfg, pacer, job.artifact, routes)
 					if err == nil {
 						break
 					}
@@ -268,15 +291,18 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 					if !rateErr.Valid {
 						delay = rateLimitBackoff(rateLimitAttempts - 1)
 					}
+					jobCfg.emit(progressEvent{Event: "retry_wait", Artifact: job.artifact.Path, RetryDelayMS: delay.Milliseconds(), RetryAfter: rateErr.Valid, ElapsedMS: time.Since(started).Milliseconds()})
 					if err := waitContext(ctx, delay); err != nil {
 						return
 					}
 				}
 				if err != nil {
+					jobCfg.emit(progressEvent{Event: "artifact_failed", Artifact: job.artifact.Path, ElapsedMS: time.Since(started).Milliseconds()})
 					fail(fmt.Errorf("%s: %w", job.artifact.Path, err))
 					return
 				}
 				if !found {
+					jobCfg.emit(progressEvent{Event: "artifact_failed", Artifact: job.artifact.Path, Outcome: "not_found", ElapsedMS: time.Since(started).Milliseconds()})
 					unavailableMu.Lock()
 					unavailable = append(unavailable, job.artifact)
 					unavailableMu.Unlock()
@@ -284,6 +310,7 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 				}
 				discoveredRoutes[job.index] = route
 				if requireHit && status != "HIT" {
+					jobCfg.emit(progressEvent{Event: "artifact_failed", Artifact: job.artifact.Path, Outcome: "expected_hit", ElapsedMS: time.Since(started).Milliseconds()})
 					fail(fmt.Errorf("%s: second pass returned cache status %q, expected HIT", job.artifact.Path, status))
 					return
 				}
@@ -303,6 +330,7 @@ func runPass(parent context.Context, cfg RunConfig, artifacts []Artifact, select
 					fail(fmt.Errorf("%s: unexpected cache status %q", job.artifact.Path, status))
 					return
 				}
+				jobCfg.emit(progressEvent{Event: "artifact_complete", Artifact: job.artifact.Path, Route: route, CacheStatus: status, Outcome: "verified", Completed: atomic.LoadInt64(&stats.Artifacts), ElapsedMS: time.Since(started).Milliseconds()})
 			}
 		}()
 	}
@@ -377,6 +405,18 @@ func waitContext(ctx context.Context, delay time.Duration) error {
 }
 
 func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPacer, artifact Artifact, route string) (string, bool, error) {
+	started := time.Now()
+	var sent, headers time.Time
+	event := progressEvent{Event: "request_start", Artifact: artifact.Path, Route: route}
+	cfg.emit(event)
+	defer func() {
+		event.Event = "request_end"
+		event.ElapsedMS = time.Since(started).Milliseconds()
+		if !headers.IsZero() {
+			event.BodyMS = time.Since(headers).Milliseconds()
+		}
+		cfg.emit(event)
+	}()
 	target, err := url.JoinPath(cfg.BaseURL, route, artifact.Path)
 	if err != nil {
 		return "", false, fmt.Errorf("build request URL: %w", err)
@@ -391,17 +431,34 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPa
 	} else if cfg.BasicUsername != "" {
 		request.SetBasicAuth(cfg.BasicUsername, cfg.BasicPassword)
 	}
-	response, err := pacer.do(ctx, cfg.HTTPClient, request)
+	response, err := pacer.do(ctx, cfg.HTTPClient, request, func() {
+		sent = time.Now()
+		event.PacingMS = sent.Sub(started).Milliseconds()
+		cfg.emit(progressEvent{Event: "request_sent", Artifact: artifact.Path, Route: route, PacingMS: event.PacingMS})
+	})
+	if !sent.IsZero() {
+		event.HeadersMS = time.Since(sent).Milliseconds()
+	}
 	if err != nil {
+		event.Outcome = "transport_error"
 		return "", false, fmt.Errorf("request package firewall: %w", err)
 	}
 	defer response.Body.Close()
+	headers = time.Now()
+	event.HTTPStatus = response.StatusCode
+	event.CacheStatus = strings.ToUpper(strings.TrimSpace(response.Header.Get(cacheStatusHeader)))
+	event.RequestID = response.Header.Get("X-Request-ID")
+	event.Event = "request_headers"
+	cfg.emit(event)
 	if response.StatusCode == http.StatusNotFound {
-		_, _ = io.Copy(io.Discard, response.Body)
+		event.Outcome = "not_found"
+		event.Bytes, _ = io.Copy(io.Discard, response.Body)
 		return "", false, nil
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		event.Outcome = "http_error"
 		if response.StatusCode == http.StatusTooManyRequests {
+			event.Outcome = "rate_limited"
 			header := strings.TrimSpace(response.Header.Get("Retry-After"))
 			delay, valid := retryAfterDelay(header, time.Now())
 			return "", false, &rateLimitError{Delay: delay, Valid: valid, Header: header}
@@ -409,13 +466,17 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPa
 		return "", false, fmt.Errorf("package firewall returned HTTP %d", response.StatusCode)
 	}
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, response.Body); err != nil {
+	event.Outcome = "body_error"
+	event.Bytes, err = io.Copy(hasher, response.Body)
+	if err != nil {
 		return "", false, fmt.Errorf("read response: %w", err)
 	}
 	actual := hex.EncodeToString(hasher.Sum(nil))
 	if !containsChecksum(artifact.SHA256, actual) {
+		event.Outcome = "checksum_mismatch"
 		return "", false, fmt.Errorf("SHA-256 mismatch: got %s", actual)
 	}
+	event.Outcome = "verified"
 	return strings.ToUpper(strings.TrimSpace(response.Header.Get(cacheStatusHeader))), true, nil
 }
 

@@ -55,6 +55,100 @@ empty=testRuntimeClasspath
 	}
 }
 
+// com.google.guava:guava:33.4.8-android declares its JRE variant as
+// ../33.4.8-jre/guava-33.4.8-jre.jar, so Gradle records that file under the
+// -android component. Requesting it from the -android directory 404s, which
+// failed a 1,921-artifact prewarm on its last artifact.
+func TestDiscoverGradleFetchesCrossVersionVariantArtifactsFromTheirOwnVersion(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "service", "gradle.lockfile"), `
+# generated
+com.google.guava:guava:33.4.8-android=compileClasspath
+com.google.guava:guava:33.4.8-jre=runtimeClasspath
+`)
+	writeFile(t, filepath.Join(root, "gradle", "verification-metadata.xml"), `
+<verification-metadata>
+  <components>
+    <component group="com.google.guava" name="guava" version="33.4.8-android">
+      <artifact name="guava-33.4.8-android.module"><sha256 value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/></artifact>
+      <artifact name="guava-33.4.8-jre.jar"><sha256 value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"/></artifact>
+    </component>
+    <component group="com.google.guava" name="guava" version="33.4.8-jre">
+      <artifact name="guava-33.4.8-jre.jar"><sha256 value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"/></artifact>
+      <artifact name="guava-33.4.8-jre.module"><sha256 value="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"/></artifact>
+    </component>
+  </components>
+</verification-metadata>
+`)
+
+	manifest, err := DiscoverGradle(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Artifact{
+		{Coordinate: "com.google.guava:guava:33.4.8-android", Path: "com/google/guava/guava/33.4.8-android/guava-33.4.8-android.module", SHA256: []string{strings.Repeat("a", 64)}},
+		{Coordinate: "com.google.guava:guava:33.4.8-jre", Path: "com/google/guava/guava/33.4.8-jre/guava-33.4.8-jre.jar", SHA256: []string{strings.Repeat("b", 64)}},
+		{Coordinate: "com.google.guava:guava:33.4.8-jre", Path: "com/google/guava/guava/33.4.8-jre/guava-33.4.8-jre.module", SHA256: []string{strings.Repeat("c", 64)}},
+	}
+	if len(manifest.Artifacts) != len(want) {
+		t.Fatalf("artifacts = %#v", manifest.Artifacts)
+	}
+	for index := range want {
+		got := manifest.Artifacts[index]
+		if got.Coordinate != want[index].Coordinate || got.Path != want[index].Path || strings.Join(got.SHA256, ",") != strings.Join(want[index].SHA256, ",") {
+			t.Fatalf("artifact %d = %#v want %#v", index, got, want[index])
+		}
+	}
+	// The -android component must not produce a jar under its own version.
+	for _, artifact := range manifest.Artifacts {
+		if artifact.Path == "com/google/guava/guava/33.4.8-android/guava-33.4.8-jre.jar" {
+			t.Fatalf("cross-version variant jar still requested from the -android directory")
+		}
+	}
+}
+
+// A version that prefixes another must not shadow the longer match.
+func TestDiscoverGradlePrefersTheLongestSiblingVersionMatch(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "service", "gradle.lockfile"), `
+# generated
+org.example:library:1.2=compileClasspath
+org.example:library:1.2.1=runtimeClasspath
+`)
+	writeFile(t, filepath.Join(root, "gradle", "verification-metadata.xml"), `
+<verification-metadata>
+  <components>
+    <component group="org.example" name="library" version="1.2">
+      <artifact name="library-1.2.pom"><sha256 value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"/></artifact>
+      <artifact name="library-1.2.1.jar"><sha256 value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"/></artifact>
+    </component>
+    <component group="org.example" name="library" version="1.2.1">
+      <artifact name="library-1.2.1.jar"><sha256 value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"/></artifact>
+    </component>
+  </components>
+</verification-metadata>
+`)
+
+	manifest, err := DiscoverGradle(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, artifact := range manifest.Artifacts {
+		if artifact.Path == "org/example/library/1.2/library-1.2.1.jar" {
+			t.Fatalf("1.2 shadowed the longer 1.2.1 match: %#v", artifact)
+		}
+	}
+	found := false
+	for _, artifact := range manifest.Artifacts {
+		if artifact.Path == "org/example/library/1.2.1/library-1.2.1.jar" && artifact.Coordinate == "org.example:library:1.2.1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("1.2.1 jar not resolved to its own version: %#v", manifest.Artifacts)
+	}
+}
+
 func TestDiscoverGradleIncludesOnlySelectedActivePluginMarkers(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "gradle.lockfile"), "org.example:library:1.0=runtimeClasspath\n")

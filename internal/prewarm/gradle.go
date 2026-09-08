@@ -88,6 +88,11 @@ func DiscoverGradle(root, verificationPath string, activePluginMarkerValues ...s
 	artifactsByPath := make(map[string]*artifactRecord)
 	foundComponents := make(map[string]struct{})
 	foundPluginMarkers := make(map[string]struct{})
+	versionsByModule := make(map[string][]string)
+	for _, component := range components {
+		module := component.Group + ":" + component.Name
+		versionsByModule[module] = append(versionsByModule[module], component.Version)
+	}
 	for _, component := range components {
 		coordinate := gradleCoordinate(component.Group, component.Name, component.Version)
 		_, isLocked := locked[coordinate]
@@ -111,19 +116,22 @@ func DiscoverGradle(root, verificationPath string, activePluginMarkerValues ...s
 				continue
 			}
 			foundArtifact = true
-			artifactPath, err := mavenArtifactPath(component, artifact.Name)
+			module := component.Group + ":" + component.Name
+			publishedVersion := publishedArtifactVersion(component, artifact.Name, versionsByModule[module])
+			artifactPath, err := mavenArtifactPath(component, publishedVersion, artifact.Name)
 			if err != nil {
 				return GradleManifest{}, fmt.Errorf("%s artifact %q: %w", coordinate, artifact.Name, err)
 			}
+			publishedCoordinate := gradleCoordinate(component.Group, component.Name, publishedVersion)
 			record := artifactsByPath[artifactPath]
 			if record == nil {
 				record = &artifactRecord{
-					coordinate:   coordinate,
+					coordinate:   publishedCoordinate,
 					pluginMarker: isActivePluginMarker,
 					checksums:    make(map[string]struct{}),
 				}
 				artifactsByPath[artifactPath] = record
-			} else if record.coordinate != coordinate {
+			} else if record.coordinate != publishedCoordinate {
 				return GradleManifest{}, fmt.Errorf("artifact path %q belongs to multiple coordinates", artifactPath)
 			}
 			for _, checksum := range checksums {
@@ -319,11 +327,45 @@ func validSHA256s(values []verificationChecksum) ([]string, error) {
 	return checksums, nil
 }
 
-func mavenArtifactPath(component verificationComponent, artifact string) (string, error) {
+// publishedArtifactVersion reports the version directory an artifact is actually
+// published under. Gradle Module Metadata lets one component's variant point at a
+// file published beside a different version: com.google.guava:guava:33.4.8-android
+// declares its JRE variant as ../33.4.8-jre/guava-33.4.8-jre.jar, and Gradle records
+// that file under the -android component. Fetching it from the component's own
+// version directory 404s, so trust the file name when it names a sibling version.
+func publishedArtifactVersion(component verificationComponent, artifact string, moduleVersions []string) string {
+	published := ""
+	for _, version := range append([]string{component.Version}, moduleVersions...) {
+		if !namesVersion(artifact, component.Name, version) {
+			continue
+		}
+		// Longest wins: 1.2 also prefixes library-1.2.1.jar, which belongs to 1.2.1.
+		if len(version) > len(published) {
+			published = version
+		}
+	}
+	if published == "" {
+		return component.Version
+	}
+	return published
+}
+
+// namesVersion reports whether a Maven file name is <name>-<version> followed by
+// an extension or a classifier, rather than merely sharing a version prefix.
+func namesVersion(artifact, name, version string) bool {
+	prefix := name + "-" + version
+	if !strings.HasPrefix(artifact, prefix) {
+		return false
+	}
+	boundary := artifact[len(prefix):]
+	return strings.HasPrefix(boundary, ".") || strings.HasPrefix(boundary, "-")
+}
+
+func mavenArtifactPath(component verificationComponent, version, artifact string) (string, error) {
 	groupParts := strings.Split(component.Group, ".")
 	parts := make([]string, 0, len(groupParts)+3)
 	parts = append(parts, groupParts...)
-	parts = append(parts, component.Name, component.Version, artifact)
+	parts = append(parts, component.Name, version, artifact)
 	for _, part := range parts {
 		if !safeMavenSegment(part) {
 			return "", fmt.Errorf("unsafe Maven path segment %q", part)

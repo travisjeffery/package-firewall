@@ -88,6 +88,19 @@ docker build -t package-firewall .
 docker compose up
 ```
 
+## CI Image Build
+
+CI runs Go tests, `go vet`, and an arm64 Docker image build. On pushes to
+`main`, it can also publish to ECR when these repository variables are set:
+
+- `AWS_ROLE_ARN`
+- `AWS_REGION`
+- `ECR_REGISTRY`
+- `ECR_REPOSITORY`
+
+The control-plane Kubernetes deployment lives in the backend `control` Helm
+chart, not in this repository.
+
 ## Live Smoke Tests
 
 The default unit test suite does not hit public registries. To verify the
@@ -120,8 +133,32 @@ Important settings:
 
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
+- `cache.backend`: set to `filesystem` or `s3_dynamodb` to cache exact-version package artifacts; the default `none` keeps package-firewall as a streaming proxy.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
 - `auth.bearer_token_env` and `auth.basic_*_env`: require clients to authenticate to the firewall.
+
+## Artifact Shielding
+
+Artifact shielding is optional and provider-selectable:
+
+- `none`: no persistence; package-firewall stays a streaming policy proxy.
+- `filesystem`: stores cached bodies and metadata under
+  `cache.filesystem.directory`. This works anywhere local disk or a mounted
+  volume is available.
+- `s3_dynamodb`: stores cached bodies in S3 and metadata in DynamoDB for AWS
+  deployments.
+
+Every request still goes through the normal policy and OSV decision path before
+cached content is served. Fresh cache hits avoid upstream package registries;
+stale exact-version artifacts can be served during upstream errors within the
+configured stale window.
+
+The filesystem backend is local to the process unless the directory is backed
+by shared storage. For multi-replica deployments, use shared storage or a shared
+backend such as S3/DynamoDB if cache consistency across replicas matters.
+
+This cache does not yet cache registry metadata or share OSV results across
+replicas.
 
 ## Current Limits
 

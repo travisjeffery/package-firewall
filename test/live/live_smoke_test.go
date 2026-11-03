@@ -155,8 +155,8 @@ func startFirewall(t *testing.T, root string, tmp string, configPath string) str
 	t.Cleanup(cancel)
 
 	serverLog := &bytes.Buffer{}
-	binary := filepath.Join(tmp, "package-firewall")
-	run(t, root, os.Environ(), "go", "build", "-o", binary, "./cmd/package-firewall")
+	binary := filepath.Join(tmp, "tidewaiter")
+	run(t, root, os.Environ(), "go", "build", "-o", binary, "./cmd/tidewaiter")
 	cmd := exec.CommandContext(ctx, binary, "serve", "--config", configPath)
 	cmd.Dir = root
 	cmd.Stdout = serverLog
@@ -166,7 +166,7 @@ func startFirewall(t *testing.T, root string, tmp string, configPath string) str
 		"PFW_PUBLIC_BASE_URL="+baseURL,
 	)
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start package-firewall: %v", err)
+		t.Fatalf("start tidewaiter: %v", err)
 	}
 	t.Cleanup(func() {
 		stopProcess(cmd)
@@ -265,7 +265,7 @@ func waitForHealth(t *testing.T, baseURL string, serverLog *bytes.Buffer) {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Fatalf("package-firewall did not become healthy\n%s", serverLog.String())
+	t.Fatalf("tidewaiter did not become healthy\n%s", serverLog.String())
 }
 
 func requireTool(t *testing.T, name string) {

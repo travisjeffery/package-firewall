@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 var npmTarballVersionRE = regexp.MustCompile(`^(.+)-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\.tgz$`)

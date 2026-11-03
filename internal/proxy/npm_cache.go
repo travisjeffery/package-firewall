@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/config"
 )
 
 func (p *Proxy) prepareNPMCacheResponse(resp *http.Response, route config.RouteConfig, target string, requestedAt, receivedAt time.Time) (time.Time, string) {

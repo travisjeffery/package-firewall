@@ -358,7 +358,7 @@ func TestRunDoesNotFallbackOrdinaryArtifactsToPluginRoute(t *testing.T) {
 		Path:       "com/example/implementation/1.0/implementation-1.0.jar",
 		SHA256:     []string{sum("implementation")},
 	}}, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "unavailable from configured Package Firewall routes") {
+	if err == nil || !strings.Contains(err.Error(), "unavailable from configured Tidewaiter routes") {
 		t.Fatalf("error = %v", err)
 	}
 	mu.Lock()

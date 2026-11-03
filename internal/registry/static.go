@@ -3,7 +3,7 @@ package registry
 import (
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 // identifyStatic handles routes that mirror fixed build assets -- a Gradle

@@ -3,7 +3,7 @@ package registry
 import (
 	"testing"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 func TestPackageFromPURL(t *testing.T) {

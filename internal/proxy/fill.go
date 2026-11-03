@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/artifactcache"
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/coordination"
+	"github.com/travisjeffery/tidewaiter/internal/artifactcache"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/coordination"
 )
 
 type fillCall struct {

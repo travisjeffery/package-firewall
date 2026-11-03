@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 type Route struct {

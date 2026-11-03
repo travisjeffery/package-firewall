@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 func Decide(result Result, defaultAction policy.Action, blockThreshold float64) policy.Decision {

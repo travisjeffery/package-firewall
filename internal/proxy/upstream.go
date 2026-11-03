@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/config"
 )
 
 var ErrUpstreamQueueTimeout = errors.New("upstream request queue timed out")

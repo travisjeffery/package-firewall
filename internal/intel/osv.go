@@ -15,8 +15,8 @@ import (
 	gocvss30 "github.com/pandatix/go-cvss/30"
 	gocvss31 "github.com/pandatix/go-cvss/31"
 	gocvss40 "github.com/pandatix/go-cvss/40"
-	"github.com/travisjeffery/package-firewall/internal/cache"
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/cache"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 	"golang.org/x/mod/semver"
 )
 

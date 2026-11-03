@@ -3,7 +3,7 @@ package registry
 import (
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 func identifyMaven(route Route, relative string, info RequestInfo) RequestInfo {

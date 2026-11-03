@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/explain"
-	"github.com/travisjeffery/package-firewall/internal/intel"
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/explain"
+	"github.com/travisjeffery/tidewaiter/internal/intel"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 type fixedProvider struct {
@@ -87,7 +87,7 @@ func TestBlockedResponseExplainsTheAdvisory(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Blocked by Package Firewall: shell-quote@1.9.0", "GHSA-pqg4-j6r4-53mv (CVE-2026-102422)", "severity 9.2 >= threshold 9.0", "Fixed in 1.11.0", "Request ID: req-42", "Exceptions: https://example.test/exceptions"} {
+	for _, want := range []string{"Blocked by Tidewaiter: shell-quote@1.9.0", "GHSA-pqg4-j6r4-53mv (CVE-2026-102422)", "severity 9.2 >= threshold 9.0", "Fixed in 1.11.0", "Request ID: req-42", "Exceptions: https://example.test/exceptions"} {
 		if !strings.Contains(body.Error, want) {
 			t.Errorf("error %q missing %q", body.Error, want)
 		}
@@ -107,7 +107,7 @@ func TestBlockedResponseExplainsTheAdvisory(t *testing.T) {
 	if got := rec.Header().Get("X-Package-Firewall-Request-Id"); got != "req-42" {
 		t.Errorf("request id header = %q", got)
 	}
-	if got := rec.Header().Get("X-Package-Firewall-Reason"); !strings.HasPrefix(got, "Blocked by Package Firewall: shell-quote@1.9.0 has GHSA") {
+	if got := rec.Header().Get("X-Package-Firewall-Reason"); !strings.HasPrefix(got, "Blocked by Tidewaiter: shell-quote@1.9.0 has GHSA") {
 		t.Errorf("reason header = %q", got)
 	}
 }
@@ -157,9 +157,9 @@ func TestExplainByPURLAndAsText(t *testing.T) {
 		query string
 		want  string
 	}{
-		{"purl=pkg:pypi/evil@1.0", "Blocked by Package Firewall: evil@1.0 matches deny rule pkg:pypi/evil@*."},
-		{"purl=pkg:npm/shell-quote@1.12.0", "Package Firewall allows shell-quote@1.12.0: policy and intel allowed package."},
-		{"url=" + url.QueryEscape("/pypi/files/aa/bb/evil-1.0-py3-none-any.whl"), "Blocked by Package Firewall: evil@1.0 matches deny rule"},
+		{"purl=pkg:pypi/evil@1.0", "Blocked by Tidewaiter: evil@1.0 matches deny rule pkg:pypi/evil@*."},
+		{"purl=pkg:npm/shell-quote@1.12.0", "Tidewaiter allows shell-quote@1.12.0: policy and intel allowed package."},
+		{"url=" + url.QueryEscape("/pypi/files/aa/bb/evil-1.0-py3-none-any.whl"), "Blocked by Tidewaiter: evil@1.0 matches deny rule"},
 	} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodGet, "/explain?format=text&"+tt.query, nil)))

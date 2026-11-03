@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/artifactcache"
-	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/artifactcache"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
 )
 
 func TestNPMFreshnessLifetime(t *testing.T) {

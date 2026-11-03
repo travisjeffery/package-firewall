@@ -1,6 +1,8 @@
-# Package Firewall
+# Tidewaiter
 
-Package Firewall is a self-hosted registry proxy that blocks risky package downloads before they reach developer machines, CI jobs, or internal mirrors.
+Tidewaiter, a package firewall. A tidewaiter was the customs officer who boarded ships to inspect cargo before it landed.
+
+Tidewaiter is a self-hosted registry proxy that blocks risky package downloads before they reach developer machines, CI jobs, or internal mirrors.
 
 V1 supports:
 
@@ -15,7 +17,7 @@ It is intentionally a registry proxy, not a TLS-intercepting proxy. Package mana
 
 ```bash
 go test ./...
-go run ./cmd/package-firewall serve --config configs/package-firewall.example.yml
+go run ./cmd/tidewaiter serve --config configs/package-firewall.example.yml
 ```
 
 Health checks:
@@ -97,7 +99,7 @@ alias, the severity against the block threshold, the affected range, the fixed
 version, a request ID, and the exceptions link. For example:
 
 ```text
-Blocked by Package Firewall: shell-quote@1.9.0 has GHSA-pqg4-j6r4-53mv (CVE-2026-102422),
+Blocked by Tidewaiter: shell-quote@1.9.0 has GHSA-pqg4-j6r4-53mv (CVE-2026-102422),
 severity 9.2 >= threshold 9.0: shell-quote: `quote()` command injection ... Affected: >=1.8.4,
 <1.11.0. Fixed in 1.11.0; upgrade to a fixed version (update the lockfile, or override the
 transitive dependency). Details: https://osv.dev/vulnerability/GHSA-pqg4-j6r4-53mv.
@@ -149,20 +151,30 @@ past the OSV cache TTL and used when OSV is unreachable, so
 `fail_open_intel_errors` cannot serve a package already seen to be malicious;
 the next successful OSV answer replaces it.
 
+## Names
+
+Tidewaiter was called Package Firewall. For one release the `package-firewall`
+and `pfw` commands remain as aliases of `tidewaiter`, and the image links
+`package-firewall` to it. Operational names keep the old spelling so existing
+deployments, dashboards and clients keep working: the `X-Package-Firewall-*`
+headers, `package_firewall_*` metrics, `PFW_*` environment variables, the
+`package-firewall` auth realm, the `package-firewall.yml` config path, and the
+default cache and coordination prefixes.
+
 ## CLI
 
 ```bash
-go run ./cmd/pfw validate --config configs/package-firewall.example.yml
-go run ./cmd/pfw routes --config configs/package-firewall.example.yml
-go run ./cmd/pfw identify --ecosystem go --prefix /go/ --path /go/golang.org/x/mod/@v/v0.30.0.zip
-go run ./cmd/pfw decide --ecosystem npm --name lodash --version 4.17.21
+go run ./cmd/tidewaiter validate --config configs/package-firewall.example.yml
+go run ./cmd/tidewaiter routes --config configs/package-firewall.example.yml
+go run ./cmd/tidewaiter identify --ecosystem go --prefix /go/ --path /go/golang.org/x/mod/@v/v0.30.0.zip
+go run ./cmd/tidewaiter decide --ecosystem npm --name lodash --version 4.17.21
 ```
 
 ### Gradle cache prewarming
 
-`pfw prewarm` discovers committed `gradle.lockfile` files, intersects them with
+`tidewaiter prewarm` discovers committed `gradle.lockfile` files, intersects them with
 `gradle/verification-metadata.xml`, and downloads the resulting exact artifacts
-through Package Firewall with a default concurrency of two. Active plugin marker
+through Tidewaiter with a default concurrency of two. Active plugin marker
 coordinates can be selected explicitly because Gradle does not write them to
 dependency lockfiles; historical marker entries left in additive verification
 metadata are not selected automatically. A configured Gradle Plugin Portal route
@@ -180,7 +192,7 @@ run can resume without repeating them.
 Check the manifest without making network requests:
 
 ```bash
-go run ./cmd/pfw prewarm --check --root ../backend
+go run ./cmd/tidewaiter prewarm --check --root ../backend
 ```
 
 Warm a deployed firewall without putting a credential on the command line:
@@ -188,7 +200,7 @@ Warm a deployed firewall without putting a credential on the command line:
 ```bash
 export PFW_BASE_URL=https://packages.example.com
 export PACKAGE_FIREWALL_TOKEN=replace-me
-go run ./cmd/pfw prewarm \
+go run ./cmd/tidewaiter prewarm \
   --root ../backend \
   --plugin-route-prefix /gradle-plugins/ \
   --plugin-marker-coordinate com.example.plugin:com.example.plugin.gradle.plugin:1.2.3 \
@@ -237,7 +249,7 @@ insufficient cache-write settling, or an artifact path that bypasses caching.
 ## Docker
 
 ```bash
-docker build -t package-firewall .
+docker build -t tidewaiter .
 docker compose up
 ```
 
@@ -412,7 +424,7 @@ create a secure bucket or attach lifecycle management to an existing bucket:
 
 ```hcl
 module "package_firewall_cache" {
-  source = "git::https://github.com/travisjeffery/package-firewall.git//deploy/opentofu/modules/s3-cache?ref=vX.Y.Z"
+  source = "git::https://github.com/travisjeffery/tidewaiter.git//deploy/opentofu/modules/s3-cache?ref=vX.Y.Z"
 
   bucket_name    = "company-package-firewall-cache"
   cache_prefix   = "artifacts"
@@ -444,7 +456,7 @@ output and least-privilege IAM policy cover `GetItem`, `UpdateItem`, and
 
 ```hcl
 module "package_firewall_coordination" {
-  source = "git::https://github.com/travisjeffery/package-firewall.git//deploy/opentofu/modules/dynamodb-coordination?ref=vX.Y.Z"
+  source = "git::https://github.com/travisjeffery/tidewaiter.git//deploy/opentofu/modules/dynamodb-coordination?ref=vX.Y.Z"
 
   table_name = "company-package-firewall-coordination"
   key_prefix = "production"

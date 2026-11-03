@@ -3,7 +3,7 @@ package intel
 import (
 	"context"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 type Finding struct {

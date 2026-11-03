@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 var pypiNormalizeRE = regexp.MustCompile(`[-_.]+`)

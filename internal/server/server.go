@@ -16,16 +16,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/audit"
-	"github.com/travisjeffery/package-firewall/internal/cachemetrics"
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/coordination"
-	"github.com/travisjeffery/package-firewall/internal/explain"
-	"github.com/travisjeffery/package-firewall/internal/intel"
-	"github.com/travisjeffery/package-firewall/internal/policy"
-	"github.com/travisjeffery/package-firewall/internal/proxy"
-	"github.com/travisjeffery/package-firewall/internal/registry"
-	"github.com/travisjeffery/package-firewall/internal/release"
+	"github.com/travisjeffery/tidewaiter/internal/audit"
+	"github.com/travisjeffery/tidewaiter/internal/cachemetrics"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/coordination"
+	"github.com/travisjeffery/tidewaiter/internal/explain"
+	"github.com/travisjeffery/tidewaiter/internal/intel"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/proxy"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/release"
 )
 
 type Server struct {
@@ -150,13 +150,13 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if !matched || !route.AllowAnonymous {
 		if !s.authorized(r) {
 			s.addAuthenticationChallenges(w.Header())
-			writeJSON(w, http.StatusUnauthorized, errorBody("unauthorized", "missing or invalid package firewall credentials", requestID))
+			writeJSON(w, http.StatusUnauthorized, errorBody("unauthorized", "missing or invalid Tidewaiter credentials", requestID))
 			s.metrics.Request(authMetricsRoute, http.StatusUnauthorized)
 			return
 		}
 	}
 	if !matched {
-		writeJSON(w, http.StatusNotFound, errorBody("not_found", "no package firewall route matched this path", requestID))
+		writeJSON(w, http.StatusNotFound, errorBody("not_found", "no Tidewaiter route matched this path", requestID))
 		s.metrics.Request(unmatchedMetricsRoute, http.StatusNotFound)
 		return
 	}
@@ -248,7 +248,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	// so an anonymous caller learns nothing about which routes exist.
 	if !(targetErr == nil && anonymous) && !s.authorized(r) {
 		s.addAuthenticationChallenges(w.Header())
-		writeJSON(w, http.StatusUnauthorized, errorBody("unauthorized", "missing or invalid package firewall credentials", requestID))
+		writeJSON(w, http.StatusUnauthorized, errorBody("unauthorized", "missing or invalid Tidewaiter credentials", requestID))
 		return
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -300,7 +300,7 @@ func (s *Server) explainTarget(query url.Values) (config.RouteConfig, registry.R
 		route, matched = s.matchNPMTarballFallback(parsed.Path)
 	}
 	if !matched {
-		return config.RouteConfig{}, registry.RequestInfo{}, false, errors.New("no package firewall route matches the url path")
+		return config.RouteConfig{}, registry.RequestInfo{}, false, errors.New("no Tidewaiter route matches the url path")
 	}
 	return route, registry.Identify(toRegistryRoute(route), parsed.Path), route.AllowAnonymous, nil
 }

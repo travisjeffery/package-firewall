@@ -1,4 +1,4 @@
-module github.com/travisjeffery/package-firewall
+module github.com/travisjeffery/tidewaiter
 
 go 1.26.0
 

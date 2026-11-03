@@ -83,9 +83,6 @@ func TestProxyPreservesNPMCookieCacheSafetyGates(t *testing.T) {
 		{name: "custom port", upstream: "https://registry.npmjs.org:8443"},
 		{name: "URL credentials", upstream: "https://user:password@registry.npmjs.org"},
 		{name: "configured upstream query", upstream: "https://registry.npmjs.org?token=private"},
-		{name: "other ecosystem", mutate: func(_ *http.Request, _ *http.Response, route *config.RouteConfig, _ *registry.RequestInfo) {
-			route.Ecosystem = "maven"
-		}},
 		{name: "upstream token", mutate: func(_ *http.Request, _ *http.Response, route *config.RouteConfig, _ *registry.RequestInfo) {
 			route.UpstreamTokenEnv = "NPM_CACHE_TEST_TOKEN"
 		}},
@@ -236,7 +233,7 @@ func TestProxyDoesNotStripCDNCookiesFromAuthenticatedUpstreamResponses(t *testin
 	}
 }
 
-func TestValidNPMCDNCookie(t *testing.T) {
+func TestValidCDNCookie(t *testing.T) {
 	for _, test := range []struct {
 		value string
 		valid bool
@@ -257,7 +254,7 @@ func TestValidNPMCDNCookie(t *testing.T) {
 		{"__cf_bm=bot;", false},
 	} {
 		t.Run(test.value, func(t *testing.T) {
-			if got := validNPMCDNCookie(test.value); got != test.valid {
+			if got := validCDNCookie(test.value); got != test.valid {
 				t.Fatalf("valid = %v, want %v", got, test.valid)
 			}
 		})

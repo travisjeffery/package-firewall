@@ -250,14 +250,38 @@ run "existing_bucket_mode_is_lifecycle_only" {
   }
 
   assert {
+    condition     = length(jsondecode(output.runtime_iam_policy_json).Statement) == 2
+    error_message = "Runtime IAM policy must contain only bucket-list and cache-object statements."
+  }
+
+  assert {
+    condition = toset([
+      for statement in jsondecode(output.runtime_iam_policy_json).Statement : statement.Sid
+    ]) == toset(["PackageFirewallCacheList", "PackageFirewallCacheObjects"])
+    error_message = "Runtime IAM policy statements must remain structurally identifiable."
+  }
+
+  assert {
     condition = sort(
       jsondecode(output.runtime_iam_policy_json).Statement[0].Action
+    ) == sort(["s3:ListBucket"])
+    error_message = "Runtime IAM policy must let S3 identify missing cache objects."
+  }
+
+  assert {
+    condition     = jsondecode(output.runtime_iam_policy_json).Statement[0].Resource == output.bucket_arn
+    error_message = "Runtime bucket-list permission must target only the configured cache bucket."
+  }
+
+  assert {
+    condition = sort(
+      jsondecode(output.runtime_iam_policy_json).Statement[1].Action
     ) == sort(["s3:GetObject", "s3:PutObject"])
     error_message = "Runtime IAM policy must grant only cache reads and writes."
   }
 
   assert {
-    condition     = jsondecode(output.runtime_iam_policy_json).Statement[0].Resource == output.cache_object_arn
+    condition     = jsondecode(output.runtime_iam_policy_json).Statement[1].Resource == output.cache_object_arn
     error_message = "Runtime IAM policy must target only the configured cache prefix."
   }
 

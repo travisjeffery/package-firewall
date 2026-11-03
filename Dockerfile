@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS build
+FROM golang:1.26.10-alpine AS build
 
 WORKDIR /src
 COPY go.mod go.sum* ./
@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/package-firewall .
   && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/pfw ./cmd/pfw
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates curl
+RUN apk add --no-cache --upgrade ca-certificates ca-certificates-bundle curl
 WORKDIR /app
 COPY --from=build /out/package-firewall /usr/local/bin/package-firewall
 COPY --from=build /out/pfw /usr/local/bin/pfw

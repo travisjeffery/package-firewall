@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +45,7 @@ var (
 	errUnsafeUpstreamRedirect   = errors.New("upstream redirect changes origin")
 	errUpstreamRedirectLimit    = errors.New("upstream redirect limit exceeded")
 	errUnreplayableBodyRedirect = errors.New("upstream redirect requires replaying a streaming request body")
+	errEncodedRewriteBody       = errors.New("upstream sent an encoded body that must be rewritten")
 )
 
 type CacheMetrics interface {
@@ -236,10 +237,12 @@ func (p *Proxy) Serve(w http.ResponseWriter, r *http.Request, route config.Route
 		p.cache.Metrics.Bypass(route.Name, bypassReason)
 		w.Header().Set(cacheHeader, "BYPASS")
 	}
-	return p.serveUpstream(w, r, route, target, "", nil)
+	return p.serveUpstream(w, r, route, target, "", rewritableRoute(route) && info.Kind != "artifact", nil)
 }
 
-func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route config.RouteConfig, target, cacheKey string, complete func()) (Result, error) {
+// rewritesMetadata marks a registry metadata request whose body may be rewritten;
+// artifacts are never rewritten and keep the client's encoding negotiation.
+func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route config.RouteConfig, target, cacheKey string, rewritesMetadata bool, complete func()) (Result, error) {
 	if complete == nil {
 		complete = func() {}
 	}
@@ -255,7 +258,12 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 		return Result{}, err
 	}
 	copyRequestHeaders(req.Header, r.Header)
-	if cacheKey != "" {
+	// Registry metadata is rewritten byte-for-byte to point downloads back at the
+	// firewall. A compressed body defeats that silently: pip and uv send gzip,
+	// and every wheel then came straight from files.pythonhosted.org. A client
+	// that refuses identity still gets it for metadata: RFC 9110 12.5.3 allows
+	// disregarding Accept-Encoding, and an unrewritten body would escape the firewall.
+	if cacheKey != "" || rewritesMetadata {
 		req.Header.Set("Accept-Encoding", "identity")
 	}
 	if route.UpstreamTokenEnv != "" {
@@ -275,25 +283,49 @@ func (p *Proxy) serveUpstream(w http.ResponseWriter, r *http.Request, route conf
 	if cacheKey != "" {
 		npmExpiresAt, npmBypassReason = p.prepareNPMCacheResponse(resp, route, target, requestedAt, receivedAt)
 	}
+	// Cloudflare fronts several upstreams (e.g. Maven Central) and now attaches a
+	// __cf_bm bot-management cookie to every artifact response, which would otherwise
+	// bypass caching through responseBypassReason. Those CDN visitor cookies must
+	// never be persisted or replayed to another client, so strip them from the
+	// forwarded response whenever every Set-Cookie is a recognised CDN cookie; on a
+	// cacheable response this also keeps them out of the stored entry and lets the
+	// TTL path store it. This runs for any keyed non-npm response, including ones
+	// that then bypass for another reason (non-200, private, redirect) — stripping a
+	// CDN visitor cookie there is still correct, and the bypass is unaffected. Any
+	// non-CDN Set-Cookie leaves them all in place so the response_set_cookie bypass
+	// still protects a genuine session cookie. The npm freshness path handles its
+	// own routes above via prepareNPMCacheResponse.
+	if cacheKey != "" && route.Ecosystem != "npm" {
+		if cookies := resp.Header.Values("Set-Cookie"); len(cookies) != 0 {
+			allCDN := true
+			for _, value := range cookies {
+				if !validCDNCookie(value) {
+					allCDN = false
+					break
+				}
+			}
+			if allCDN {
+				resp.Header.Del("Set-Cookie")
+			}
+		}
+	}
 	copyResponseHeaders(w.Header(), resp.Header)
 	if p.shouldRewrite(route, resp) {
+		if encoding, ok := identityContentEncoding(resp.Header.Values("Content-Encoding")); !ok {
+			return Result{}, fmt.Errorf("%w: %s", errEncodedRewriteBody, encoding)
+		}
 		if cacheKey != "" {
 			p.cache.Metrics.Bypass(route.Name, "response_rewrite")
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
-		if err != nil {
-			return Result{}, err
-		}
-		body = p.rewriteBody(route, body)
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		// The rewrite changes the length and streams, so the upstream length no longer applies.
+		w.Header().Del("Content-Length")
 		w.WriteHeader(resp.StatusCode)
-		_, err = io.Copy(w, bytes.NewReader(body))
-		return Result{StatusCode: resp.StatusCode}, err
+		return Result{StatusCode: resp.StatusCode}, rewriteStream(w, resp.Body, p.rewriteRules(route))
 	}
 	if cacheKey != "" {
 		responseReason := npmBypassReason
 		if responseReason == "" {
-			responseReason = p.responseBypassReason(resp, target, !npmExpiresAt.IsZero())
+			responseReason = p.responseBypassReason(resp, route, target, !npmExpiresAt.IsZero())
 		}
 		if responseReason == "" {
 			storeOwnsCompletion = true
@@ -332,23 +364,50 @@ func (p *Proxy) cacheKey(r *http.Request, route config.RouteConfig, info registr
 	if r.Body != nil && r.Body != http.NoBody {
 		return "", "request_body"
 	}
-	if representationVaries(r.Header) {
+	if !cacheableRequestRepresentation(r.Header) {
 		return "", "representation"
 	}
+	// Entries on an enforcing route may have been fetched through an allowlisted
+	// redirect, and carry no record of which origin served them. Binding the key
+	// to the policy means revoking an origin's trust orphans anything already
+	// stored under the old allowlist instead of serving it until its TTL expires.
+	components := []string{http.MethodGet, route.Name, route.Ecosystem, target, "representation-v2", "identity"}
 	if route.Ecosystem == "npm" {
-		return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target, "npm-freshness-v2"), ""
+		components = append(components, "npm-freshness-v2")
 	}
-	return artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target), ""
+	if fingerprint := redirectPolicyFingerprint(route); fingerprint != "" {
+		components = append(components, fingerprint)
+	}
+	return artifactcache.Key(components...), ""
 }
 
-func (p *Proxy) responseBypassReason(resp *http.Response, target string, freshNPM bool) string {
+func redirectPolicyFingerprint(route config.RouteConfig) string {
+	if !route.EnforceRedirectOrigins {
+		return ""
+	}
+	origins := make([]string, 0, len(route.AllowedRedirectOrigins))
+	for _, value := range route.AllowedRedirectOrigins {
+		origin, err := config.NormalizeHTTPOrigin(value)
+		if err != nil {
+			origin = value
+		}
+		origins = append(origins, origin)
+	}
+	sort.Strings(origins)
+	sum := sha256.Sum256([]byte(strings.Join(origins, "\n")))
+	return "redirect-policy-" + hex.EncodeToString(sum[:8])
+}
+
+func (p *Proxy) responseBypassReason(resp *http.Response, route config.RouteConfig, target string, freshNPM bool) string {
 	if resp.StatusCode != http.StatusOK {
 		return "upstream_status"
 	}
 	if resp.Request != nil && (resp.Request.Context().Value(upstreamRedirectedKey{}) == true || (resp.Request.URL != nil && resp.Request.URL.String() != target)) {
-		return "upstream_redirect"
+		if !cacheableRedirect(resp, route) {
+			return "upstream_redirect"
+		}
 	}
-	if resp.Header.Get("Vary") != "" {
+	if !cacheableResponseVary(resp.Header) {
 		return "response_vary"
 	}
 	if len(resp.Header.Values("Set-Cookie")) != 0 {
@@ -734,19 +793,97 @@ func hasCacheDirective(values []string, directives ...string) bool {
 	return false
 }
 
-func representationVaries(headers http.Header) bool {
-	if accept := strings.TrimSpace(strings.Join(headers.Values("Accept"), ",")); accept != "" && accept != "*/*" {
-		return true
-	}
-	if encoding := strings.TrimSpace(strings.Join(headers.Values("Accept-Encoding"), ",")); encoding != "" && !strings.EqualFold(encoding, "identity") {
-		return true
-	}
+func cacheableRequestRepresentation(headers http.Header) bool {
 	for _, name := range []string{"Accept-Charset", "Accept-Language", "A-IM", "Cookie", "Origin", "Prefer", "Want-Digest"} {
 		if headers.Get(name) != "" {
-			return true
+			return false
 		}
 	}
-	return false
+	return identityEncodingAccepted(headers.Values("Accept-Encoding"))
+}
+
+func identityEncodingAccepted(values []string) bool {
+	raw := strings.TrimSpace(strings.Join(values, ","))
+	if raw == "" {
+		return true
+	}
+	identitySeen := false
+	identityAccepted := false
+	wildcardSeen := false
+	wildcardAccepted := false
+	for _, item := range strings.Split(raw, ",") {
+		parts := strings.Split(item, ";")
+		coding := strings.ToLower(strings.TrimSpace(parts[0]))
+		if coding == "" {
+			return false
+		}
+		accepted, valid := encodingQualityAccepted(parts[1:])
+		if !valid {
+			return false
+		}
+		switch coding {
+		case "identity":
+			identitySeen = true
+			identityAccepted = identityAccepted || accepted
+		case "*":
+			wildcardSeen = true
+			wildcardAccepted = wildcardAccepted || accepted
+		}
+	}
+	if identitySeen {
+		return identityAccepted
+	}
+	return !wildcardSeen || wildcardAccepted
+}
+
+func encodingQualityAccepted(parameters []string) (bool, bool) {
+	if len(parameters) == 0 {
+		return true, true
+	}
+	if len(parameters) != 1 {
+		return false, false
+	}
+	name, value, found := strings.Cut(parameters[0], "=")
+	if !found || !strings.EqualFold(strings.TrimSpace(name), "q") {
+		return false, false
+	}
+	return qualityAccepted(strings.TrimSpace(value))
+}
+
+func qualityAccepted(value string) (bool, bool) {
+	whole, fraction, hasFraction := strings.Cut(value, ".")
+	if !hasFraction {
+		fraction = ""
+	}
+	if len(fraction) > 3 {
+		return false, false
+	}
+	for _, digit := range fraction {
+		if digit < '0' || digit > '9' {
+			return false, false
+		}
+	}
+	switch whole {
+	case "0":
+		return strings.ContainsAny(fraction, "123456789"), true
+	case "1":
+		return !strings.ContainsAny(fraction, "123456789"), true
+	default:
+		return false, false
+	}
+}
+
+func cacheableResponseVary(headers http.Header) bool {
+	for _, value := range headers.Values("Vary") {
+		for _, name := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "", "accept-encoding":
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 type upstreamRedirectedKey struct{}
@@ -786,6 +923,10 @@ func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.R
 		}
 		return nil
 	}
+	// CheckRedirect only sees requests, so the hop responses -- and any cache
+	// directives steering them -- are visible only from the transport.
+	hops := &redirectHops{}
+	client.Transport = recordRedirectHops(client.Transport, hops)
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -795,9 +936,119 @@ func (p *Proxy) doOnce(request *http.Request, route config.RouteConfig) (*http.R
 		return nil, err
 	}
 	if redirected && response.Request != nil {
-		response.Request = response.Request.WithContext(context.WithValue(response.Request.Context(), upstreamRedirectedKey{}, true))
+		ctx := context.WithValue(response.Request.Context(), upstreamRedirectedKey{}, true)
+		ctx = context.WithValue(ctx, upstreamRedirectHopsKey{}, hops.uncacheable())
+		response.Request = response.Request.WithContext(ctx)
 	}
 	return response, nil
+}
+
+type upstreamRedirectHopsKey struct{}
+
+type redirectHops struct {
+	mu           sync.Mutex
+	uncacheableH bool
+}
+
+// uncacheable reports whether any followed hop declared directives that make the
+// artifact it selected unsafe to store under the originally requested key.
+func (h *redirectHops) uncacheable() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.uncacheableH
+}
+
+func (h *redirectHops) observe(resp *http.Response) {
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return
+	}
+	// cacheableResponseVary, not "any Vary at all": the Gradle Plugin Portal sends
+	// Vary: accept-encoding on the hop that reaches Maven Central, and rejecting
+	// that made every plugin marker permanently uncacheable. Accept-Encoding is
+	// pinned to identity for anything cacheable and is part of the key, so varying
+	// on it selects nothing the key does not already carry.
+	control := strings.ToLower(resp.Header.Get("Cache-Control"))
+	if cacheableResponseVary(resp.Header) && !strings.Contains(control, "no-store") && !strings.Contains(control, "private") {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.uncacheableH = true
+}
+
+type redirectHopRecorder struct {
+	base http.RoundTripper
+	hops *redirectHops
+}
+
+func (r redirectHopRecorder) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := r.base.RoundTrip(request)
+	if err == nil && response != nil {
+		r.hops.observe(response)
+	}
+	return response, err
+}
+
+func recordRedirectHops(base http.RoundTripper, hops *redirectHops) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return redirectHopRecorder{base: base, hops: hops}
+}
+
+// cacheableRedirect reports whether a redirected response may be stored.
+//
+// upstreamRedirectPolicy already decides whether a redirect may be *followed*,
+// against a per-route origin allowlist, and the bytes it returns are already
+// served to the client. Refusing to also cache them buys nothing when the
+// destination is one the route explicitly trusts: the Gradle Plugin Portal
+// serves Central-published plugin markers by redirecting to
+// repo.maven.apache.org, which that route allowlists, so those artifacts could
+// never be cached and a prewarm second pass could never see them as a HIT.
+//
+// Only a redirect to an origin the route enforces an allowlist for is cacheable.
+// A route that does not enforce origins has no allowlist to appeal to, and a
+// same-origin redirect is deliberately excluded: npm's CDN bounces a tarball
+// request through an unrelated path on the same host, so caching that under the
+// requested key would store bytes fetched from somewhere else and persist the
+// visitor cookies that come with them.
+func cacheableRedirect(resp *http.Response, route config.RouteConfig) bool {
+	if resp.Request == nil || !route.EnforceRedirectOrigins {
+		return false
+	}
+	// A hop that declares Vary or no-store may have selected this artifact from a
+	// forwarded header the cache key does not carry, so it must not be replayed.
+	if resp.Request.Context().Value(upstreamRedirectHopsKey{}) == true {
+		return false
+	}
+	finalOrigin, err := requestOrigin(resp.Request.URL)
+	if err != nil {
+		return false
+	}
+	// Checked before the allowlist, not after: a route may redundantly list its
+	// own upstream origin, and that must not make a same-origin bounce cacheable.
+	upstream, err := upstreamOrigin(route.UpstreamURL)
+	if err != nil || finalOrigin == upstream {
+		return false
+	}
+	for _, value := range route.AllowedRedirectOrigins {
+		allowed, err := config.NormalizeHTTPOrigin(value)
+		if err != nil {
+			continue
+		}
+		if allowed == finalOrigin {
+			return true
+		}
+	}
+	return false
+}
+
+func upstreamOrigin(value string) (string, error) {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", err
+	}
+	return requestOrigin(parsed)
 }
 
 func upstreamRedirectPolicy(enforce bool, allowedOrigins []string, observe func(string, string)) (func(*http.Request, []*http.Request) error, error) {
@@ -924,28 +1175,37 @@ func safeUpstreamPath(value string) (string, error) {
 	return path, nil
 }
 
+// identityContentEncoding reports whether every Content-Encoding field, split on
+// commas, is empty or identity. Header.Get reads only the first field, which let
+// "identity" followed by a separate "gzip" field through.
+func identityContentEncoding(values []string) (string, bool) {
+	for _, value := range values {
+		for _, coding := range strings.Split(value, ",") {
+			coding = strings.TrimSpace(coding)
+			if coding != "" && !strings.EqualFold(coding, "identity") {
+				return strings.Join(values, ", "), false
+			}
+		}
+	}
+	return "", true
+}
+
+func rewritableRoute(route config.RouteConfig) bool {
+	return route.Ecosystem == "npm" || route.Ecosystem == "pypi"
+}
+
 func (p *Proxy) shouldRewrite(route config.RouteConfig, resp *http.Response) bool {
 	contentType := resp.Header.Get("Content-Type")
-	if route.Ecosystem == "npm" && strings.Contains(contentType, "application/json") {
+	// pnpm, Yarn and npm ask for the abbreviated packument, served as
+	// application/vnd.npm.install-v1+json; matching only application/json left
+	// its tarball URLs on registry.npmjs.org.
+	if route.Ecosystem == "npm" && (strings.Contains(contentType, "application/json") || strings.Contains(contentType, "application/vnd.npm.install-v1+json")) {
 		return true
 	}
 	if route.Ecosystem == "pypi" && (strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/vnd.pypi.simple") || strings.Contains(contentType, "application/json")) {
 		return true
 	}
 	return false
-}
-
-func (p *Proxy) rewriteBody(route config.RouteConfig, body []byte) []byte {
-	switch route.Ecosystem {
-	case "npm":
-		return bytes.ReplaceAll(body, []byte("https://registry.npmjs.org/"), []byte(p.baseURL+strings.TrimRight(route.PathPrefix, "/")+"/"))
-	case "pypi":
-		body = bytes.ReplaceAll(body, []byte("https://files.pythonhosted.org/"), []byte(p.baseURL+strings.TrimRight(route.PathPrefix, "/")+"/files/"))
-		body = bytes.ReplaceAll(body, []byte("http://files.pythonhosted.org/"), []byte(p.baseURL+strings.TrimRight(route.PathPrefix, "/")+"/files/"))
-		return body
-	default:
-		return body
-	}
 }
 
 func copyRequestHeaders(dst, src http.Header) {

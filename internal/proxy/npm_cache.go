@@ -30,7 +30,7 @@ func (p *Proxy) prepareNPMCacheResponse(resp *http.Response, route config.RouteC
 		return time.Time{}, "response_cache_control"
 	}
 	for _, value := range resp.Header.Values("Set-Cookie") {
-		if !validNPMCDNCookie(value) {
+		if !validCDNCookie(value) {
 			return time.Time{}, "response_set_cookie"
 		}
 	}
@@ -60,7 +60,7 @@ func (p *Proxy) prepareNPMCacheResponse(resp *http.Response, route config.RouteC
 	candidate := *resp
 	candidate.Header = resp.Header.Clone()
 	candidate.Header.Del("Set-Cookie")
-	if reason := p.responseBypassReason(&candidate, target, true); reason != "" {
+	if reason := p.responseBypassReason(&candidate, route, target, true); reason != "" {
 		return time.Time{}, reason
 	}
 	candidate.Header.Set("Age", strconv.FormatInt(int64(age/time.Second), 10))
@@ -113,7 +113,7 @@ func npmDeltaSeconds(value string) (time.Duration, bool) {
 	return time.Duration(seconds) * time.Second, err == nil
 }
 
-func validNPMCDNCookie(value string) bool {
+func validCDNCookie(value string) bool {
 	cookie, err := http.ParseSetCookie(value)
 	if err != nil || len(cookie.Unparsed) != 0 || cookie.Valid() != nil || (cookie.Name != "__cf_bm" && cookie.Name != "_cfuvid") {
 		return false

@@ -74,6 +74,50 @@ allow:
 
 Explicit deny rules take precedence over allow and warn rules. Explicit allow rules skip OSV checks. Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy and skips OSV; canonical versioned metadata is cached as immutable, while mutable selectors are not. `.zip` module archives remain evaluated.
 
+## Why was my install blocked?
+
+A blocked download returns `403` with an explanation: the advisory and its CVE
+alias, the severity against the block threshold, the affected range, the fixed
+version, a request ID, and the exceptions link. For example:
+
+```text
+Blocked by Package Firewall: shell-quote@1.9.0 has GHSA-pqg4-j6r4-53mv (CVE-2026-102422),
+severity 9.2 >= threshold 9.0: shell-quote: `quote()` command injection ... Affected: >=1.8.4,
+<1.11.0. Fixed in 1.11.0; upgrade to a fixed version (update the lockfile, or override the
+transitive dependency). Details: https://osv.dev/vulnerability/GHSA-pqg4-j6r4-53mv.
+Request ID: 1234567890123456789. Exceptions: <decision.exceptions_url>
+```
+
+Only npm prints a 403 body (as the text after `403 Forbidden - GET <url> -`).
+pnpm, Yarn 1, Yarn Berry (`YN0035`), pip, uv, Maven and Gradle print just the
+status and URL. The same explanation is in the `X-Package-Firewall-Reason`,
+`X-Package-Firewall-Advisory` and `X-Package-Firewall-Request-Id` headers, and
+in the JSON body's `explanation` object.
+
+For every other client, ask the firewall with the URL from the error:
+
+```bash
+curl -fsS --netrc -G https://packages.example.com/explain \
+  --data-urlencode "url=https://packages.example.com/npm/shell-quote/-/shell-quote-1.9.0.tgz" \
+  --data-urlencode format=text
+curl -fsS --netrc -G https://packages.example.com/explain \
+  --data-urlencode "purl=pkg:npm/shell-quote@1.9.0"
+```
+
+`/explain` re-runs the same decision without downloading anything. It requires
+the same credentials as the proxy (none for a URL on an `allow_anonymous`
+route), accepts `url=` (any artifact URL the firewall
+serves) or `purl=` (`pkg:npm`, `pkg:pypi`, `pkg:maven/group/artifact`,
+`pkg:golang`), returns JSON or, with `format=text`, the one-line message. It
+also explains allowed and warned versions, and it is rate limited (`429` with
+`Retry-After`).
+
+Block kinds and their next step: a vulnerability (upgrade to a fixed version,
+or replace the dependency when none is published), an OSV `MAL-` malicious
+package (remove it and treat the machine as compromised), a deny rule, the
+release cooldown (allowed after a given time), an unidentifiable artifact path,
+and a failed vulnerability lookup when intel errors fail closed.
+
 ## CLI
 
 ```bash
@@ -126,6 +170,24 @@ runs. `--min-request-interval` spaces first-pass requests across all workers,
 and `--rate-limit-retries` bounds delayed retries after upstream `429`
 responses (one retry by default).
 
+The CLI streams JSON progress to stderr while keeping pass summaries on stdout.
+Each artifact reports its pass, path, attempt, selected route, HTTP/cache status,
+request ID, bytes, and elapsed time. Request events separate pacing/worker wait,
+time to response headers (including connection setup), and body reading/checksum
+time. A `retry_wait` event reports the planned delay in milliseconds and whether
+it came from `Retry-After` before sleeping, so a long upstream cooldown is visible.
+Start, sent, and headers events identify the current phase even if a request is
+still blocked. Completion counts include resumed checkpoint entries; checkpoint
+entries are labeled separately from requests verified in this run.
+Each pass closes with a `pass_end` event totalling its requests, retries,
+cooldown wait, and pacing/header/body time, so a pass that spent most of its
+wall clock waiting on upstream `Retry-After` is visible without reprocessing the
+stream. `retry_wait_ms` totals the delays the run *planned* to wait, so a pass
+interrupted mid-cooldown reports more wait than it served. A pass killed
+outright emits no `pass_end`; use the per-artifact events for that case.
+Credentials, full URLs, response bodies, and unselected headers are not logged.
+Progress does not change pacing, timeout, retry, checksum, or second-pass HIT gates.
+
 `--exclude-coordinate` is repeatable and accepts only a complete locked
 `group:name:version`. Use it only for a dependency that the Gradle build keeps
 on an external vendor or private repository. This keeps repository routing
@@ -147,6 +209,15 @@ insufficient cache-write settling, or an artifact path that bypasses caching.
 docker build -t package-firewall .
 docker compose up
 ```
+
+## Image Build
+
+The Makefile wraps the common tasks: `make test`, `make vet`, and
+`make docker-build` (an arm64 image by default; override `PLATFORM`). To push
+to ECR, `make docker-push-ecr` composes the registry from `AWS_ACCOUNT_ID` and
+`AWS_REGION`, resolving the account from the AWS CLI when it is not set, or
+takes `ECR_REGISTRY` outright. `ECR_REPOSITORY` and `TAG` default to
+`package-firewall` and the short commit SHA.
 
 ## Live Smoke Tests
 
@@ -194,6 +265,7 @@ Important settings:
 - `coordination.lease_duration` and `coordination.poll_interval`: bound distributed artifact-fill ownership and waiter polling.
 - `decision.fail_open_intel_errors`: allow package downloads when OSV or another intelligence provider is unavailable.
 - `decision.fail_open_unknown_package`: allow requests where the adapter cannot identify a concrete package version.
+- `decision.exceptions_url` (`PFW_EXCEPTIONS_URL`): link included in every block message telling developers how to request an allow rule.
 - `routes[].upstream_token_env`: injects an upstream bearer token from an environment variable without logging the secret.
 - `routes[].enforce_redirect_origins`: opt in to keeping redirects on the original origin plus the exact origins configured for the route; disabled by default while required origins are observed.
 - `routes[].allowed_redirect_origins`: exact additional HTTP(S) origins accepted when redirect-origin enforcement is enabled.
@@ -222,9 +294,9 @@ enabling `enforce_redirect_origins`.
 The artifact cache is deliberately narrower than a general HTTP cache:
 
 - Authentication, package identification, local policy, and OSV-based decisions run before every cache lookup. A newly blocked package cannot be served from an old cache entry.
-- Only exact package artifacts identified with a concrete name, version, and PURL are eligible. Requests must be bodyless `GET`s with no query, `Range`, conditional headers, cache-revalidation directives, cookies, or representation-selecting headers.
-- Only upstream status `200` responses are stored. Redirected, ranged, encoded, `Vary`, `Set-Cookie`, `private`, `no-cache`, and `no-store` responses bypass storage.
-- One `Set-Cookie` exception applies to otherwise cache-eligible npm artifacts fetched directly from `https://registry.npmjs.org` without configured upstream credentials: explicitly `public` responses with a valid positive `s-maxage` or `max-age` may contain only the Cloudflare `__cf_bm` and `_cfuvid` cookies. Those cookies are removed before forwarding and storage. Unknown or malformed cookies still prevent caching.
+- Only exact package artifacts identified with a concrete name, version, and PURL are eligible. Requests must be bodyless `GET`s with no query, `Range`, conditional headers, cache-revalidation directives, cookies, or unsupported representation-selecting headers. Clients that permit an identity response share one bounded identity-encoding representation; `Accept` is forwarded upstream but does not create cache variants.
+- Only upstream status `200` responses are stored. Redirected, ranged, encoded, unsupported `Vary`, `Set-Cookie`, `private`, `no-cache`, and `no-store` responses bypass storage. `Vary: Accept-Encoding` is supported because upstream requests are normalized to identity; `Vary: Accept` bypasses storage.
+- A `Set-Cookie` exception applies to otherwise cache-eligible artifacts whose only cookies are the Cloudflare CDN cookies `__cf_bm` and `_cfuvid`. Cloudflare fronts registries such as Maven Central and attaches `__cf_bm` to every artifact response; without this exception that cookie would bypass caching for every object. When each `Set-Cookie` is a valid `__cf_bm` or `_cfuvid` cookie it is removed before forwarding and storage, so the cookie is never persisted or replayed to another client. Any other `Set-Cookie` (an unknown name or a malformed CDN cookie) leaves all cookies in place and still prevents caching. For npm artifacts fetched directly from `https://registry.npmjs.org` without configured upstream credentials, the same cookie stripping applies on the freshness-based caching path (explicitly `public` responses with a valid positive `s-maxage` or `max-age`); for Maven Central and the other non-npm artifact routes it applies on the TTL-based caching path.
 - These public npm responses may use `must-revalidate` or `proxy-revalidate`; `immutable` is not required. Their stored lifetime is capped by both `cache.artifact_ttl` and the remaining upstream freshness, accounting for `Age`, `Date`, and transfer time. Positive `s-maxage` takes precedence even when `max-age=0`. Expired entries require a new upstream fetch, never a stale fallback. Original cache directives are preserved. Missing, stale, or ambiguous freshness metadata bypasses storage, as do private, no-cache, or no-store responses and any `Pragma: no-cache` directive.
 - npm cache keys use a new freshness-policy namespace, so entries written by older versions are not reused during rolling upgrades. Other ecosystems keep their existing cache keys; no stored objects are deleted by this change.
 - A miss streams the complete upstream response to the client independently of a bounded temp-file capture. The capture stops at `cache.max_object_size`; bounded backend stores continue in the background and cannot delay response completion.
@@ -282,13 +354,19 @@ coordination:
 
 The process uses the AWS SDK default credential chain. Set `AWS_REGION` to the
 bucket's region. On EKS, use an EKS Pod Identity or IRSA-backed service account
-instead of static credentials. The runtime role only needs object access under
-the configured prefix:
+instead of static credentials. The runtime role needs bucket-list access so S3
+can distinguish a missing cache object from an authorization failure, while
+object access remains confined to the configured prefix:
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::company-package-firewall-cache"
+    },
     {
       "Effect": "Allow",
       "Action": ["s3:GetObject", "s3:PutObject"],

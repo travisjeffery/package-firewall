@@ -73,7 +73,7 @@ func (p *Proxy) serveCacheMiss(w http.ResponseWriter, r *http.Request, route con
 func (p *Proxy) serveLocalFillLeader(w http.ResponseWriter, r *http.Request, route config.RouteConfig, target, key string, call *fillCall) (Result, error) {
 	if p.coordination.Coordinator == nil {
 		p.recordFillLeader(route.Name)
-		return p.serveUpstream(w, r, route, target, key, func() { p.fills.finish(key, call) })
+		return p.serveUpstream(w, r, route, target, key, false, func() { p.fills.finish(key, call) })
 	}
 	recordedWaiter := false
 	for {
@@ -86,7 +86,7 @@ func (p *Proxy) serveLocalFillLeader(w http.ResponseWriter, r *http.Request, rou
 			p.recordFillLeader(route.Name)
 			fillContext, cancelFill := context.WithCancel(r.Context())
 			stopLease := p.keepLease(lease, route.Name, key, cancelFill)
-			return p.serveUpstream(w, r.Clone(fillContext), route, target, key, func() {
+			return p.serveUpstream(w, r.Clone(fillContext), route, target, key, false, func() {
 				stopLease()
 				cancelFill()
 				p.fills.finish(key, call)

@@ -185,7 +185,7 @@ func TestProxyNPMDoesNotReuseLegacyFreshnessEntries(t *testing.T) {
 	current := time.Now().UTC().Truncate(time.Second)
 	route := testNPMRoute("https://registry.npmjs.org")
 	target := "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"
-	legacyKey := artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target)
+	legacyKey := artifactcache.Key(http.MethodGet, route.Name, route.Ecosystem, target, "representation-v2", "identity")
 	store := newMemoryArtifactStore()
 	if err := store.Put(context.Background(), legacyKey, artifactcache.PutRequest{
 		Headers: http.Header{"Cache-Control": {"public, immutable, max-age=60"}},
@@ -212,7 +212,7 @@ func TestProxyNPMDoesNotReuseLegacyFreshnessEntries(t *testing.T) {
 		otherRoute := route
 		otherRoute.Name, otherRoute.Ecosystem = "maven", "maven"
 		key, reason := proxy.cacheKey(request, otherRoute, exactArtifactInfo(), target)
-		if reason != "" || key != artifactcache.Key(http.MethodGet, otherRoute.Name, otherRoute.Ecosystem, target) {
+		if reason != "" || key != artifactcache.Key(http.MethodGet, otherRoute.Name, otherRoute.Ecosystem, target, "representation-v2", "identity") {
 			t.Fatal("non-npm cache key changed")
 		}
 	}

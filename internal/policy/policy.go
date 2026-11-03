@@ -29,10 +29,37 @@ type Package struct {
 	PublishedAt time.Time
 }
 
+// BlockKind classifies why a decision was made, so a block can be explained
+// with the next step that fits it.
+type BlockKind string
+
+const (
+	KindPolicyRule     BlockKind = "policy_rule"
+	KindCooldown       BlockKind = "cooldown"
+	KindUnknownPackage BlockKind = "unknown_package"
+	KindVulnerability  BlockKind = "vulnerability"
+	KindMalware        BlockKind = "malware"
+	KindIntelError     BlockKind = "intel_error"
+)
+
 type Decision struct {
-	Action      Action
-	Reason      string
-	MatchedRule string
+	Action       Action
+	Reason       string
+	MatchedRule  string
+	Kind         BlockKind
+	Advisory     *Advisory
+	AllowedAfter time.Time
+}
+
+type Advisory struct {
+	ID        string   `json:"id"`
+	Aliases   []string `json:"aliases,omitempty"`
+	Summary   string   `json:"summary,omitempty"`
+	Severity  float64  `json:"severity"`
+	Threshold float64  `json:"threshold"`
+	Affected  []string `json:"affected,omitempty"`
+	Fixed     []string `json:"fixed,omitempty"`
+	URL       string   `json:"url,omitempty"`
 }
 
 type Config struct {
@@ -131,15 +158,15 @@ func New(cfg Config) (*Engine, error) {
 
 func (e *Engine) Evaluate(pkg Package) Decision {
 	if pkg.PURL == "" {
-		return Decision{Action: ActionUnknown, Reason: "package version could not be identified"}
+		return Decision{Action: ActionUnknown, Reason: "package version could not be identified", Kind: KindUnknownPackage}
 	}
 	for _, rule := range e.rules {
 		if rule.re.MatchString(pkg.PURL) {
-			return Decision{Action: rule.action, Reason: fmt.Sprintf("matched %s policy", rule.action), MatchedRule: rule.pattern}
+			return Decision{Action: rule.action, Reason: fmt.Sprintf("matched %s policy", rule.action), MatchedRule: rule.pattern, Kind: KindPolicyRule}
 		}
 	}
 	if e.cooldown.Enabled && !pkg.PublishedAt.IsZero() && time.Since(pkg.PublishedAt) < e.cooldown.MinAge {
-		return Decision{Action: ActionBlock, Reason: "package is newer than cooldown policy"}
+		return Decision{Action: ActionBlock, Reason: "package is newer than cooldown policy", Kind: KindCooldown, AllowedAfter: pkg.PublishedAt.Add(e.cooldown.MinAge)}
 	}
 	return Decision{Action: ActionAllow, Reason: "no policy rule matched"}
 }

@@ -89,6 +89,8 @@ type DecisionConfig struct {
 	FailOpenUnknownPackage      bool    `yaml:"fail_open_unknown_package"`
 	VulnerabilityBlockThreshold float64 `yaml:"vulnerability_block_threshold"`
 	DefaultVulnerabilityAction  string  `yaml:"default_vulnerability_action"`
+	// ExceptionsURL is shown with every block so developers know how to ask for an allow rule.
+	ExceptionsURL string `yaml:"exceptions_url"`
 }
 
 type IntelConfig struct {
@@ -115,6 +117,13 @@ type RouteConfig struct {
 	UpstreamTokenEnv       string   `yaml:"upstream_token_env"`
 	EnforceRedirectOrigins bool     `yaml:"enforce_redirect_origins"`
 	AllowedRedirectOrigins []string `yaml:"allowed_redirect_origins"`
+	// Serve this route without credentials. Build assets are fetched by the Gradle
+	// wrapper and by Docker builds before any authenticated setup has run, so a
+	// credential requirement here cannot be satisfied -- the wrapper speaks only
+	// HTTP Basic and a container build has no operator to prompt. Restricted to
+	// ecosystem "static" below: these are fixed, public, upstream artifacts whose
+	// integrity comes from a pinned checksum, not from the transport.
+	AllowAnonymous bool `yaml:"allow_anonymous"`
 }
 
 func Default() Config {
@@ -254,6 +263,9 @@ func applyEnv(cfg *Config) error {
 	}
 	if v := os.Getenv("PFW_FAIL_OPEN_UNKNOWN_PACKAGE"); v != "" {
 		cfg.Decision.FailOpenUnknownPackage = parseBool(v, cfg.Decision.FailOpenUnknownPackage)
+	}
+	if v := os.Getenv("PFW_EXCEPTIONS_URL"); v != "" {
+		cfg.Decision.ExceptionsURL = v
 	}
 	if v := os.Getenv("PFW_OSV_ENABLED"); v != "" {
 		cfg.Intel.OSV.Enabled = parseBool(v, cfg.Intel.OSV.Enabled)
@@ -462,15 +474,23 @@ func (cfg Config) Validate() error {
 	if len(cfg.Routes) == 0 {
 		errs = append(errs, errors.New("at least one route is required"))
 	}
-	seen := map[string]bool{}
+	seenNames := map[string]bool{}
+	seenPaths := map[string]bool{}
 	for _, route := range cfg.Routes {
 		if route.Name == "" {
 			errs = append(errs, errors.New("route.name is required"))
 		}
-		if seen[route.PathPrefix] {
+		if strings.HasPrefix(route.Name, "__") {
+			errs = append(errs, fmt.Errorf("route.name %q uses reserved prefix __", route.Name))
+		}
+		if seenNames[route.Name] {
+			errs = append(errs, fmt.Errorf("duplicate route name %q", route.Name))
+		}
+		seenNames[route.Name] = true
+		if seenPaths[route.PathPrefix] {
 			errs = append(errs, fmt.Errorf("duplicate route path_prefix %q", route.PathPrefix))
 		}
-		seen[route.PathPrefix] = true
+		seenPaths[route.PathPrefix] = true
 		if !strings.HasPrefix(route.PathPrefix, "/") || !strings.HasSuffix(route.PathPrefix, "/") {
 			errs = append(errs, fmt.Errorf("route %q path_prefix must start and end with /", route.Name))
 		}
@@ -483,9 +503,14 @@ func (cfg Config) Validate() error {
 			}
 		}
 		switch route.Ecosystem {
-		case "npm", "pypi", "maven", "go":
+		// "static" mirrors fixed build assets rather than a package registry:
+		// no coordinate, so no OSV query. See registry.identifyStatic.
+		case "npm", "pypi", "maven", "go", "static":
 		default:
 			errs = append(errs, fmt.Errorf("route %q ecosystem %q is unsupported", route.Name, route.Ecosystem))
+		}
+		if route.AllowAnonymous && route.Ecosystem != "static" {
+			errs = append(errs, fmt.Errorf("route %q allow_anonymous requires ecosystem \"static\"", route.Name))
 		}
 	}
 	return errors.Join(errs...)

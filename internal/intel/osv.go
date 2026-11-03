@@ -11,8 +11,13 @@ import (
 	"strings"
 	"time"
 
+	gocvss20 "github.com/pandatix/go-cvss/20"
+	gocvss30 "github.com/pandatix/go-cvss/30"
+	gocvss31 "github.com/pandatix/go-cvss/31"
+	gocvss40 "github.com/pandatix/go-cvss/40"
 	"github.com/travisjeffery/package-firewall/internal/cache"
 	"github.com/travisjeffery/package-firewall/internal/policy"
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -77,10 +82,17 @@ func (p *OSVProvider) Query(ctx context.Context, pkg policy.Package) (Result, er
 	}
 	result := Result{Findings: make([]Finding, 0, len(decoded.Vulns))}
 	for _, vuln := range decoded.Vulns {
+		affected, fixed := affectedRanges(vuln.Affected, ecosystem, name)
+		if semverOrdered(ecosystem) {
+			fixed = fixesAfter(fixed, pkg.Version)
+		}
 		result.Findings = append(result.Findings, Finding{
 			ID:       vuln.ID,
+			Aliases:  vuln.Aliases,
 			Summary:  vuln.Summary,
 			Severity: maxSeverity(vuln.Severity),
+			Affected: affected,
+			Fixed:    fixed,
 		})
 	}
 	p.cache.Set(key, result, p.ttl)
@@ -120,21 +132,157 @@ func osvPackage(pkg policy.Package) (string, string) {
 	}
 }
 
-func maxSeverity(items []osvSeverity) float64 {
-	var max float64
-	for _, item := range items {
-		if strings.HasPrefix(strings.ToUpper(item.Type), "CVSS") {
-			score := item.Score
-			if idx := strings.LastIndex(score, "/"); idx >= 0 {
-				score = score[idx+1:]
+// affectedRanges renders the advisory's ranges for the queried package. A record
+// can cover several packages (a renamed module, a monorepo's siblings); when none
+// matches by name, every range is used rather than reporting nothing.
+func affectedRanges(entries []osvAffected, ecosystem, name string) ([]string, []string) {
+	var matching []osvAffected
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Package.Ecosystem, ecosystem) && normalizeOSVName(ecosystem, entry.Package.Name) == normalizeOSVName(ecosystem, name) {
+			matching = append(matching, entry)
+		}
+	}
+	if len(matching) == 0 {
+		matching = entries
+	}
+	var affected, fixed []string
+	seenFixed := map[string]bool{}
+	for _, entry := range matching {
+		for _, r := range entry.Ranges {
+			if r.Type == "GIT" {
+				continue
 			}
-			parsed, err := strconv.ParseFloat(score, 64)
-			if err == nil && parsed > max {
-				max = parsed
+			lower := ""
+			for _, event := range r.Events {
+				switch {
+				case event.Introduced != "":
+					lower = event.Introduced
+				case event.Fixed != "":
+					affected = append(affected, rangeText(lower, "<"+event.Fixed))
+					if !seenFixed[event.Fixed] {
+						seenFixed[event.Fixed] = true
+						fixed = append(fixed, event.Fixed)
+					}
+					lower = ""
+				case event.LastAffected != "":
+					affected = append(affected, rangeText(lower, "<="+event.LastAffected))
+					lower = ""
+				case event.Limit != "":
+					affected = append(affected, rangeText(lower, "<"+event.Limit))
+					lower = ""
+				}
+			}
+			if lower != "" {
+				affected = append(affected, rangeText(lower, ""))
 			}
 		}
 	}
+	return affected, fixed
+}
+
+// semverOrdered reports whether the ecosystem orders versions by SemVer. Maven
+// and PyPI versions often parse as SemVer but order differently (Maven puts
+// 1.0.0-sp1 after 1.0.0), so their fixes are never filtered.
+func semverOrdered(ecosystem string) bool {
+	return ecosystem == "npm" || ecosystem == "Go"
+}
+
+// fixesAfter drops fix versions older than the requested one, so a 1.9.0 user
+// is not told about the 1.7.3 fix on an older branch. Versions that do not
+// parse as SemVer are kept.
+func fixesAfter(fixed []string, version string) []string {
+	current := semverOf(version)
+	if current == "" {
+		return fixed
+	}
+	kept := make([]string, 0, len(fixed))
+	for _, candidate := range fixed {
+		if v := semverOf(candidate); v == "" || semver.Compare(v, current) > 0 {
+			kept = append(kept, candidate)
+		}
+	}
+	return kept
+}
+
+func semverOf(version string) string {
+	if !strings.HasPrefix(version, "v") {
+		version = "v" + version
+	}
+	if !semver.IsValid(version) {
+		return ""
+	}
+	return version
+}
+
+func rangeText(introduced, upper string) string {
+	if introduced == "0" {
+		introduced = ""
+	}
+	switch {
+	case introduced == "" && upper == "":
+		return "all versions"
+	case introduced == "":
+		return upper
+	case upper == "":
+		return ">=" + introduced
+	default:
+		return ">=" + introduced + ", " + upper
+	}
+}
+
+func normalizeOSVName(ecosystem, name string) string {
+	name = strings.ToLower(name)
+	if ecosystem == "PyPI" {
+		name = strings.NewReplacer("_", "-", ".", "-").Replace(name)
+	}
+	return name
+}
+
+func maxSeverity(items []osvSeverity) float64 {
+	var max float64
+	for _, item := range items {
+		if score := severityScore(item.Score); score > max {
+			max = score
+		}
+	}
 	return max
+}
+
+// severityScore resolves an OSV severity entry to a numeric CVSS base score.
+//
+// OSV reports severity as a CVSS *vector string* (e.g.
+// "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H"), not a bare number, so the
+// base score must be computed from the vector. We also accept an already-numeric
+// score for providers that report one. Anything we cannot parse yields 0 so the
+// caller falls back to the configured default action rather than mis-blocking.
+func severityScore(raw string) float64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if parsed, err := strconv.ParseFloat(raw, 64); err == nil {
+		return parsed
+	}
+	switch {
+	case strings.HasPrefix(raw, "CVSS:3.0"):
+		if c, err := gocvss30.ParseVector(raw); err == nil {
+			return c.BaseScore()
+		}
+	case strings.HasPrefix(raw, "CVSS:3.1"):
+		if c, err := gocvss31.ParseVector(raw); err == nil {
+			return c.BaseScore()
+		}
+	case strings.HasPrefix(raw, "CVSS:4.0"):
+		if c, err := gocvss40.ParseVector(raw); err == nil {
+			return c.Score()
+		}
+	default:
+		// CVSS v2 vectors carry no "CVSS:" version prefix.
+		if c, err := gocvss20.ParseVector(raw); err == nil {
+			return c.BaseScore()
+		}
+	}
+	return 0
 }
 
 type osvQuery struct {
@@ -153,8 +301,27 @@ type osvResponse struct {
 
 type osvVulnerability struct {
 	ID       string        `json:"id"`
+	Aliases  []string      `json:"aliases"`
 	Summary  string        `json:"summary"`
 	Severity []osvSeverity `json:"severity"`
+	Affected []osvAffected `json:"affected"`
+}
+
+type osvAffected struct {
+	Package osvPackageRef `json:"package"`
+	Ranges  []osvRange    `json:"ranges"`
+}
+
+type osvRange struct {
+	Type   string     `json:"type"`
+	Events []osvEvent `json:"events"`
+}
+
+type osvEvent struct {
+	Introduced   string `json:"introduced,omitempty"`
+	Fixed        string `json:"fixed,omitempty"`
+	LastAffected string `json:"last_affected,omitempty"`
+	Limit        string `json:"limit,omitempty"`
 }
 
 type osvSeverity struct {

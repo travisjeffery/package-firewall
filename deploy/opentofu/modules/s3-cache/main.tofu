@@ -14,6 +14,12 @@ locals {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "PackageFirewallCacheList"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = local.bucket_arn
+      },
+      {
         Sid      = "PackageFirewallCacheObjects"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]

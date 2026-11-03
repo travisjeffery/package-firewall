@@ -11,6 +11,7 @@ import (
 
 type Metrics struct {
 	mu                sync.RWMutex
+	requests          map[requestKey]uint64
 	hits              map[string]uint64
 	misses            map[string]uint64
 	storeErrors       map[string]uint64
@@ -22,6 +23,11 @@ type Metrics struct {
 	upstreamInFlight  map[string]int64
 	upstreamRetries   map[upstreamReasonKey]uint64
 	upstreamThrottled map[upstreamReasonKey]uint64
+}
+
+type requestKey struct {
+	route  string
+	status int
 }
 
 type bypassKey struct {
@@ -46,6 +52,7 @@ type upstreamReasonKey struct {
 
 func New() *Metrics {
 	return &Metrics{
+		requests:          make(map[requestKey]uint64),
 		hits:              make(map[string]uint64),
 		misses:            make(map[string]uint64),
 		storeErrors:       make(map[string]uint64),
@@ -58,6 +65,12 @@ func New() *Metrics {
 		upstreamRetries:   make(map[upstreamReasonKey]uint64),
 		upstreamThrottled: make(map[upstreamReasonKey]uint64),
 	}
+}
+
+func (m *Metrics) Request(route string, status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requests[requestKey{route: route, status: status}]++
 }
 
 func (m *Metrics) Hit(route string) {
@@ -136,6 +149,10 @@ func (m *Metrics) Handler() http.Handler {
 
 func (m *Metrics) WriteTo(writer io.Writer) (int64, error) {
 	m.mu.RLock()
+	requests := make(map[requestKey]uint64, len(m.requests))
+	for key, value := range m.requests {
+		requests[key] = value
+	}
 	hits := cloneMap(m.hits)
 	misses := cloneMap(m.misses)
 	storeErrors := cloneMap(m.storeErrors)
@@ -156,6 +173,7 @@ func (m *Metrics) WriteTo(writer io.Writer) (int64, error) {
 	m.mu.RUnlock()
 
 	counting := &countingWriter{writer: writer}
+	writeRequests(counting, requests)
 	writeCounter(counting, "package_firewall_cache_hits_total", "Artifact cache hits after a complete integrity-checked read.", hits)
 	writeCounter(counting, "package_firewall_cache_misses_total", "Artifact cache misses, including cache read failures that fell back to upstream.", misses)
 	writeCounter(counting, "package_firewall_cache_store_errors_total", "Artifact cache staging or backend store errors.", storeErrors)
@@ -168,6 +186,31 @@ func (m *Metrics) WriteTo(writer io.Writer) (int64, error) {
 	writeUpstreamReasons(counting, "package_firewall_upstream_throttled_total", "Requests delayed or rejected by upstream protection.", upstreamThrottled)
 	writeBypasses(counting, bypasses)
 	return counting.written, counting.err
+}
+
+func writeRequests(writer io.Writer, values map[requestKey]uint64) {
+	const name = "package_firewall_http_requests_total"
+	_, _ = fmt.Fprintf(writer, "# HELP %s Package Firewall responses by route and HTTP status.\n# TYPE %s counter\n", name, name)
+	keys := make([]requestKey, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].route == keys[j].route {
+			return keys[i].status < keys[j].status
+		}
+		return keys[i].route < keys[j].route
+	})
+	for _, key := range keys {
+		_, _ = fmt.Fprintf(
+			writer,
+			"%s{route=\"%s\",status=\"%d\"} %d\n",
+			name,
+			escapeLabel(key.route),
+			key.status,
+			values[key],
+		)
+	}
 }
 
 func writeGauge(writer io.Writer, name, help string, values map[string]int64) {

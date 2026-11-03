@@ -113,6 +113,161 @@ func TestProxyCachesGoModuleMetadata(t *testing.T) {
 	}
 }
 
+func TestProxyCachesMavenArtifactsWithCDNCookies(t *testing.T) {
+	// Cloudflare fronts Maven Central and attaches a __cf_bm (or _cfuvid) cookie to
+	// every artifact response. Those CDN cookies must not defeat caching, and must
+	// never be forwarded to the client or persisted in the stored entry.
+	tests := []struct {
+		name    string
+		cookies []string
+	}{
+		{name: "cf_bm", cookies: []string{"__cf_bm=bot; Path=/; HttpOnly; Secure; SameSite=None"}},
+		{name: "cfuvid", cookies: []string{"_cfuvid=visitor; Path=/; HttpOnly; Secure; SameSite=None"}},
+		{name: "both", cookies: []string{"__cf_bm=bot; Path=/; HttpOnly; Secure", "_cfuvid=visitor; Path=/; HttpOnly; Secure"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstreamHits := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamHits++
+				for _, cookie := range test.cookies {
+					w.Header().Add("Set-Cookie", cookie)
+				}
+				_, _ = io.WriteString(w, "maven-artifact")
+			}))
+			defer upstream.Close()
+
+			store := newMemoryArtifactStore()
+			metrics := newTestCacheMetrics()
+			proxy := newTestCachingProxy(t, store, metrics, 1024)
+			route := testMavenRoute(upstream.URL)
+			for requestNumber, want := range []string{"MISS", "HIT"} {
+				recorder := httptest.NewRecorder()
+				request := httptest.NewRequest(http.MethodGet, "/maven/com/example/lib/1.0.0/lib-1.0.0.jar", nil)
+				if _, err := proxy.Serve(recorder, request, route, mavenArtifactInfo()); err != nil {
+					t.Fatal(err)
+				}
+				if recorder.Code != http.StatusOK || recorder.Body.String() != "maven-artifact" || recorder.Header().Get(cacheHeader) != want {
+					t.Fatalf("request %d response = %d %q %q, want 200 maven-artifact %s", requestNumber, recorder.Code, recorder.Body.String(), recorder.Header().Get(cacheHeader), want)
+				}
+				if len(recorder.Header().Values("Set-Cookie")) != 0 {
+					t.Fatalf("request %d forwarded CDN cookies to the client", requestNumber)
+				}
+			}
+			if upstreamHits != 1 || store.putCalls != 1 || metrics.hits["maven"] != 1 {
+				t.Fatalf("upstream=%d stores=%d hits=%v", upstreamHits, store.putCalls, metrics.hits)
+			}
+			if got := metrics.bypasses[bypassMetricKey{route: "maven", reason: "response_set_cookie"}]; got != 0 {
+				t.Fatalf("response_set_cookie bypasses = %d, want 0", got)
+			}
+			for _, entry := range store.entries {
+				if len(entry.headers.Values("Set-Cookie")) != 0 {
+					t.Fatal("CDN cookies were stored")
+				}
+			}
+		})
+	}
+}
+
+func TestProxyDoesNotCacheMavenArtifactsWithGenuineCookies(t *testing.T) {
+	// Only the recognised CDN cookies are stripped. Any other Set-Cookie — a genuine
+	// session cookie alongside __cf_bm, a malformed CDN cookie, or a non-allowlisted
+	// name — leaves every cookie in place so the response still bypasses caching.
+	tests := []struct {
+		name    string
+		cookies []string
+	}{
+		{name: "genuine session alongside cdn", cookies: []string{"__cf_bm=bot; Path=/; HttpOnly; Secure", "session=private"}},
+		{name: "malformed cdn cookie", cookies: []string{"__cf_bm=bot; SameSite=nonsense"}},
+		{name: "non-allowlisted name", cookies: []string{"cf_clearance=token"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				for _, cookie := range test.cookies {
+					w.Header().Add("Set-Cookie", cookie)
+				}
+				_, _ = io.WriteString(w, "maven-artifact")
+			}))
+			defer upstream.Close()
+
+			store := newMemoryArtifactStore()
+			metrics := newTestCacheMetrics()
+			proxy := newTestCachingProxy(t, store, metrics, 1024)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/maven/com/example/lib/1.0.0/lib-1.0.0.jar", nil)
+			if _, err := proxy.Serve(recorder, request, testMavenRoute(upstream.URL), mavenArtifactInfo()); err != nil {
+				t.Fatal(err)
+			}
+			if recorder.Code != http.StatusOK || recorder.Body.String() != "maven-artifact" {
+				t.Fatalf("response = %d %q, want 200 maven-artifact", recorder.Code, recorder.Body.String())
+			}
+			if store.putCalls != 0 {
+				t.Fatalf("stored a response carrying a genuine cookie: puts = %d", store.putCalls)
+			}
+			if got := metrics.bypasses[bypassMetricKey{route: "maven", reason: "response_set_cookie"}]; got != 1 {
+				t.Fatalf("response_set_cookie bypasses = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestProxyStripsCDNCookiesButStillBypassesIneligibleMavenResponses(t *testing.T) {
+	// A recognised CDN cookie is stripped from the forwarded response even when the
+	// response is not cacheable for another reason. Stripping must not cause such a
+	// response to be stored, and the original bypass reason must be preserved.
+	tests := []struct {
+		name   string
+		status int
+		header http.Header
+		reason string
+	}{
+		{name: "non-200", status: http.StatusNotFound, reason: "upstream_status"},
+		{name: "private", status: http.StatusOK, header: http.Header{"Cache-Control": []string{"private"}}, reason: "response_cache_control"},
+		{name: "no-store", status: http.StatusOK, header: http.Header{"Cache-Control": []string{"no-store"}}, reason: "response_cache_control"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				for key, values := range test.header {
+					for _, value := range values {
+						w.Header().Add(key, value)
+					}
+				}
+				w.Header().Add("Set-Cookie", "__cf_bm=bot; Path=/; HttpOnly; Secure; SameSite=None")
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, "maven-artifact")
+			}))
+			defer upstream.Close()
+
+			store := newMemoryArtifactStore()
+			metrics := newTestCacheMetrics()
+			proxy := newTestCachingProxy(t, store, metrics, 1024)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/maven/com/example/lib/1.0.0/lib-1.0.0.jar", nil)
+			if _, err := proxy.Serve(recorder, request, testMavenRoute(upstream.URL), mavenArtifactInfo()); err != nil {
+				t.Fatal(err)
+			}
+			if recorder.Code != test.status || recorder.Body.String() != "maven-artifact" {
+				t.Fatalf("response = %d %q, want %d maven-artifact", recorder.Code, recorder.Body.String(), test.status)
+			}
+			if store.putCalls != 0 {
+				t.Fatalf("stored an ineligible response: puts = %d", store.putCalls)
+			}
+			if got := metrics.bypasses[bypassMetricKey{route: "maven", reason: test.reason}]; got != 1 {
+				t.Fatalf("%s bypasses = %d, want 1", test.reason, got)
+			}
+			if got := metrics.bypasses[bypassMetricKey{route: "maven", reason: "response_set_cookie"}]; got != 0 {
+				t.Fatalf("response_set_cookie bypasses = %d, want 0", got)
+			}
+			// The CDN cookie is stripped from the forwarded response even though it was not cached.
+			if len(recorder.Header().Values("Set-Cookie")) != 0 {
+				t.Fatal("CDN cookie was forwarded to the client")
+			}
+		})
+	}
+}
+
 func TestProxyCoalescesConcurrentCacheMissesInProcess(t *testing.T) {
 	const requests = 24
 	var upstreamHits atomic.Int32
@@ -442,6 +597,170 @@ func TestProxyCompletesChunkedResponseBeforeCacheStore(t *testing.T) {
 	}
 }
 
+func TestProxySharesIdentityArtifactWhenResponseDoesNotVaryOnAccept(t *testing.T) {
+	upstreamHits := 0
+	var upstreamEncodings []string
+	var upstreamAccepts []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		upstreamHits++
+		upstreamEncodings = append(upstreamEncodings, request.Header.Get("Accept-Encoding"))
+		upstreamAccepts = append(upstreamAccepts, request.Header.Get("Accept"))
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Vary", "Accept-Encoding")
+		_, _ = io.WriteString(w, "artifact-body")
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	route := testNPMRoute(upstream.URL)
+	tests := []struct {
+		accept         string
+		acceptEncoding string
+	}{
+		{accept: "application/octet-stream", acceptEncoding: "gzip"},
+		{acceptEncoding: "br"},
+		{accept: "*/*", acceptEncoding: "gzip, deflate"},
+		{accept: "Application/Octet-Stream", acceptEncoding: "zstd"},
+	}
+	for requestNumber, test := range tests {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		request.Header.Set("Accept", test.accept)
+		request.Header.Set("Accept-Encoding", test.acceptEncoding)
+		if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		wantStatus := "HIT"
+		if requestNumber == 0 {
+			wantStatus = "MISS"
+		}
+		if got := recorder.Header().Get(cacheHeader); got != wantStatus {
+			t.Fatalf("request %d cache header = %q want %q", requestNumber, got, wantStatus)
+		}
+		if got := recorder.Header().Get("Content-Type"); got != "application/octet-stream" {
+			t.Fatalf("request %d content type = %q", requestNumber, got)
+		}
+		if got := recorder.Header().Get("Vary"); got != "Accept-Encoding" {
+			t.Fatalf("request %d Vary = %q", requestNumber, got)
+		}
+		if got := recorder.Body.String(); got != "artifact-body" {
+			t.Fatalf("request %d body = %q", requestNumber, got)
+		}
+	}
+	if upstreamHits != 1 {
+		t.Fatalf("upstream hits = %d want 1", upstreamHits)
+	}
+	if got := strings.Join(upstreamEncodings, ","); got != "identity" {
+		t.Fatalf("upstream Accept-Encoding values = %q", got)
+	}
+	if got := strings.Join(upstreamAccepts, ","); got != "application/octet-stream" {
+		t.Fatalf("upstream Accept values = %q", got)
+	}
+	if store.getCalls != 4 || store.putCalls != 1 {
+		t.Fatalf("store calls: get = %d put = %d", store.getCalls, store.putCalls)
+	}
+	if metrics.hits["npm"] != 3 || metrics.misses["npm"] != 1 {
+		t.Fatalf("metrics: hits = %v misses = %v", metrics.hits, metrics.misses)
+	}
+}
+
+func TestProxyDoesNotStoreResponsesVaryingOnAccept(t *testing.T) {
+	upstreamHits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		upstreamHits++
+		w.Header().Set("Content-Type", request.Header.Get("Accept"))
+		w.Header().Set("Vary", "Accept")
+		_, _ = io.WriteString(w, request.Header.Get("Accept"))
+	}))
+	defer upstream.Close()
+
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	for requestNumber, accept := range []string{"application/xml", "application/octet-stream"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		request.Header.Set("Accept", accept)
+		if _, err := proxy.Serve(recorder, request, testNPMRoute(upstream.URL), exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		if got := recorder.Header().Get(cacheHeader); got != "MISS" {
+			t.Fatalf("request %d cache header = %q", requestNumber, got)
+		}
+		if got := recorder.Header().Get("Vary"); got != "Accept" {
+			t.Fatalf("request %d Vary = %q", requestNumber, got)
+		}
+		if got := recorder.Body.String(); got != accept {
+			t.Fatalf("request %d body = %q want %q", requestNumber, got, accept)
+		}
+	}
+	if upstreamHits != 2 {
+		t.Fatalf("upstream hits = %d want 2", upstreamHits)
+	}
+	if store.getCalls != 2 || store.putCalls != 0 {
+		t.Fatalf("store calls: get = %d put = %d", store.getCalls, store.putCalls)
+	}
+	if metrics.misses["npm"] != 2 {
+		t.Fatalf("misses = %v", metrics.misses)
+	}
+	if got := metrics.bypasses[bypassMetricKey{route: "npm", reason: "response_vary"}]; got != 2 {
+		t.Fatalf("response_vary bypasses = %d", got)
+	}
+}
+
+func TestIdentityEncodingAccepted(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{name: "absent", want: true},
+		{name: "common compression", values: []string{"gzip, br"}, want: true},
+		{name: "identity allowed", values: []string{"gzip, identity;q=0.5, *;q=0"}, want: true},
+		{name: "identity refused", values: []string{"gzip, identity;q=0"}},
+		{name: "wildcard refused", values: []string{"gzip", "*;q=0"}},
+		{name: "identity overrides wildcard", values: []string{"gzip, *;q=0, identity"}, want: true},
+		{name: "identity refusal overrides wildcard", values: []string{"*;q=1, identity;q=0"}},
+		{name: "invalid quality", values: []string{"identity;q=invalid"}},
+		{name: "too many quality digits", values: []string{"identity;q=0.0001"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := identityEncodingAccepted(test.values); got != test.want {
+				t.Fatalf("identityEncodingAccepted(%q) = %v want %v", test.values, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCacheableResponseVary(t *testing.T) {
+	tests := []struct {
+		name   string
+		values []string
+		want   bool
+	}{
+		{name: "absent", want: true},
+		{name: "accept", values: []string{"Accept"}},
+		{name: "encoding", values: []string{"Accept-Encoding"}, want: true},
+		{name: "combined", values: []string{"Accept", "accept-encoding"}},
+		{name: "language", values: []string{"Accept-Language"}},
+		{name: "wildcard", values: []string{"*"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			header := make(http.Header)
+			for _, value := range test.values {
+				header.Add("Vary", value)
+			}
+			if got := cacheableResponseVary(header); got != test.want {
+				t.Fatalf("cacheableResponseVary(%q) = %v want %v", test.values, got, test.want)
+			}
+		})
+	}
+}
+
 func TestProxyBypassesNonCanonicalRequests(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -457,8 +776,9 @@ func TestProxyBypassesNonCanonicalRequests(t *testing.T) {
 		{name: "range", reason: "range", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Range", "bytes=0-3")},
 		{name: "conditional", reason: "conditional", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("If-None-Match", `"artifact-v1"`)},
 		{name: "cache control", reason: "request_cache_control", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Cache-Control", "no-cache")},
-		{name: "accept", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept", "application/octet-stream")},
-		{name: "encoding", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip")},
+		{name: "identity encoding refused", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip, identity;q=0")},
+		{name: "wildcard encoding refused", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip, *;q=0")},
+		{name: "invalid encoding quality", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Encoding", "gzip, identity;q=invalid")},
 		{name: "language", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Accept-Language", "en-CA")},
 		{name: "cookie", reason: "representation", method: http.MethodGet, info: exactArtifactInfo(), mutate: setHeader("Cookie", "session=value")},
 		{name: "body", reason: "request_body", method: http.MethodGet, info: exactArtifactInfo(), mutate: func(request *http.Request) {
@@ -532,7 +852,7 @@ func TestProxyStoresOnlyUnconditional200Responses(t *testing.T) {
 		{name: "partial status", reason: "upstream_status", status: http.StatusPartialContent, header: http.Header{"Content-Range": []string{"bytes 0-3/8"}}, body: "part", limit: 1024},
 		{name: "not found", reason: "upstream_status", status: http.StatusNotFound, body: "missing", limit: 1024},
 		{name: "rate limited", reason: "upstream_status", status: http.StatusTooManyRequests, header: http.Header{"Retry-After": []string{"60"}}, body: "rate limited", limit: 1024},
-		{name: "vary", reason: "response_vary", status: http.StatusOK, header: http.Header{"Vary": []string{"Accept"}}, body: "artifact", limit: 1024},
+		{name: "vary", reason: "response_vary", status: http.StatusOK, header: http.Header{"Vary": []string{"Accept-Language"}}, body: "artifact", limit: 1024},
 		{name: "cookie", reason: "response_set_cookie", status: http.StatusOK, header: http.Header{"Set-Cookie": []string{"session=value"}}, body: "artifact", limit: 1024},
 		{name: "content range", reason: "response_content_range", status: http.StatusOK, header: http.Header{"Content-Range": []string{"bytes 0-7/8"}}, body: "artifact", limit: 1024},
 		{name: "encoding", reason: "response_encoding", status: http.StatusOK, header: http.Header{"Content-Encoding": []string{"gzip"}}, body: "artifact", limit: 1024},
@@ -844,6 +1164,29 @@ func testNPMRoute(upstreamURL string) config.RouteConfig {
 		Ecosystem:   "npm",
 		PathPrefix:  "/npm/",
 		UpstreamURL: strings.TrimRight(upstreamURL, "/") + "/",
+	}
+}
+
+func testMavenRoute(upstreamURL string) config.RouteConfig {
+	return config.RouteConfig{
+		Name:        "maven",
+		Ecosystem:   "maven",
+		PathPrefix:  "/maven/",
+		UpstreamURL: strings.TrimRight(upstreamURL, "/") + "/",
+	}
+}
+
+func mavenArtifactInfo() registry.RequestInfo {
+	return registry.RequestInfo{
+		Kind:          "artifact",
+		NeedsDecision: true,
+		UpstreamPath:  "/com/example/lib/1.0.0/lib-1.0.0.jar",
+		Package: policy.Package{
+			Ecosystem: "maven",
+			Name:      "com.example:lib",
+			Version:   "1.0.0",
+			PURL:      "pkg:maven/com.example/lib@1.0.0",
+		},
 	}
 }
 
@@ -1166,4 +1509,199 @@ func (*failingRenewLease) Renew(context.Context, time.Duration) error {
 func (l *failingRenewLease) Release(context.Context) error {
 	l.released.Store(true)
 	return nil
+}
+
+func TestProxyCachesRedirectToEnforcedAllowedOrigin(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "redirected-artifact")
+	}))
+	defer final.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		http.Redirect(w, request, final.URL+"/artifact", http.StatusFound)
+	}))
+	defer upstream.Close()
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	route := testNPMRoute(upstream.URL)
+	route.EnforceRedirectOrigins = true
+	route.AllowedRedirectOrigins = []string{final.URL}
+
+	for pass := range 2 {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		if recorder.Body.String() != "redirected-artifact" {
+			t.Fatalf("pass %d body = %q", pass, recorder.Body.String())
+		}
+		want := "MISS"
+		if pass == 1 {
+			want = "HIT"
+		}
+		if got := recorder.Header().Get(cacheHeader); got != want {
+			t.Fatalf("pass %d cache status = %q, want %q", pass, got, want)
+		}
+	}
+	if store.putCalls != 1 {
+		t.Fatalf("cache put calls = %d, want 1", store.putCalls)
+	}
+	if got := metrics.bypasses[bypassMetricKey{route: "npm", reason: "upstream_redirect"}]; got != 0 {
+		t.Fatalf("redirect bypasses = %d, want 0", got)
+	}
+}
+
+func TestCacheableRedirect(t *testing.T) {
+	response := func(finalURL string) *http.Response {
+		parsed, err := url.Parse(finalURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &http.Response{Request: &http.Request{URL: parsed}}
+	}
+	for _, test := range []struct {
+		name     string
+		route    config.RouteConfig
+		finalURL string
+		want     bool
+	}{
+		{
+			name:     "enforced allowlisted origin is cacheable",
+			route:    config.RouteConfig{UpstreamURL: "https://plugins.gradle.org/m2/", EnforceRedirectOrigins: true, AllowedRedirectOrigins: []string{"https://repo.maven.apache.org"}},
+			finalURL: "https://repo.maven.apache.org/maven2/a/b-1.0.pom",
+			want:     true,
+		},
+		{
+			name:     "allowlist without enforcement is not cacheable",
+			route:    config.RouteConfig{UpstreamURL: "https://plugins.gradle.org/m2/", AllowedRedirectOrigins: []string{"https://repo.maven.apache.org"}},
+			finalURL: "https://repo.maven.apache.org/maven2/a/b-1.0.pom",
+			want:     false,
+		},
+		{
+			// npm's CDN bounces a tarball through another path on the same host.
+			name:     "same-origin redirect is not cacheable",
+			route:    config.RouteConfig{UpstreamURL: "https://registry.npmjs.org/", EnforceRedirectOrigins: true},
+			finalURL: "https://registry.npmjs.org/bounce",
+			want:     false,
+		},
+		{
+			// Config validation permits a route to redundantly allowlist its own
+			// upstream; that must not re-admit the same-origin CDN bounce.
+			name:     "same-origin redirect is not cacheable even when allowlisted",
+			route:    config.RouteConfig{UpstreamURL: "https://registry.npmjs.org/", EnforceRedirectOrigins: true, AllowedRedirectOrigins: []string{"https://registry.npmjs.org"}},
+			finalURL: "https://registry.npmjs.org/bounce",
+			want:     false,
+		},
+		{
+			name:     "unlisted origin is not cacheable",
+			route:    config.RouteConfig{UpstreamURL: "https://plugins.gradle.org/m2/", EnforceRedirectOrigins: true, AllowedRedirectOrigins: []string{"https://repo.maven.apache.org"}},
+			finalURL: "https://cdn.example/a/b-1.0.pom",
+			want:     false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cacheableRedirect(response(test.finalURL), test.route); got != test.want {
+				t.Fatalf("cacheableRedirect = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRedirectPolicyFingerprintBindsCacheKeyToAllowlist(t *testing.T) {
+	base := config.RouteConfig{UpstreamURL: "https://plugins.gradle.org/m2/"}
+	if got := redirectPolicyFingerprint(base); got != "" {
+		t.Fatalf("unenforced route fingerprint = %q, want empty", got)
+	}
+
+	enforced := base
+	enforced.EnforceRedirectOrigins = true
+	enforced.AllowedRedirectOrigins = []string{"https://repo.maven.apache.org", "https://plugins-artifacts.gradle.org"}
+	before := redirectPolicyFingerprint(enforced)
+	if before == "" {
+		t.Fatal("enforced route produced no fingerprint")
+	}
+
+	reordered := enforced
+	reordered.AllowedRedirectOrigins = []string{"https://plugins-artifacts.gradle.org", "https://repo.maven.apache.org"}
+	if got := redirectPolicyFingerprint(reordered); got != before {
+		t.Fatalf("reordering the allowlist changed the fingerprint: %q vs %q", got, before)
+	}
+
+	// Revoking an origin must orphan anything stored under the old allowlist.
+	revoked := enforced
+	revoked.AllowedRedirectOrigins = []string{"https://plugins-artifacts.gradle.org"}
+	if got := redirectPolicyFingerprint(revoked); got == before {
+		t.Fatal("revoking an allowed origin left the fingerprint unchanged")
+	}
+}
+
+// The Gradle Plugin Portal answers a Central-published plugin marker with
+// 303 + "Vary: accept-encoding". Treating any Vary on a hop as disqualifying made
+// those artifacts permanently uncacheable and failed every prewarm second pass.
+func TestProxyCachesRedirectWhoseHopVariesOnAcceptEncoding(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "plugin-marker-pom")
+	}))
+	defer final.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Vary", "accept-encoding")
+		w.Header().Set("Cache-Control", "public, max-age=43200")
+		http.Redirect(w, request, final.URL+"/artifact", http.StatusSeeOther)
+	}))
+	defer upstream.Close()
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	route := testNPMRoute(upstream.URL)
+	route.EnforceRedirectOrigins = true
+	route.AllowedRedirectOrigins = []string{final.URL}
+
+	for pass := range 2 {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
+		if _, err := proxy.Serve(recorder, request, route, exactArtifactInfo()); err != nil {
+			t.Fatal(err)
+		}
+		want := "MISS"
+		if pass == 1 {
+			want = "HIT"
+		}
+		if got := recorder.Header().Get(cacheHeader); got != want {
+			t.Fatalf("pass %d cache status = %q, want %q", pass, got, want)
+		}
+	}
+	if got := metrics.bypasses[bypassMetricKey{route: "npm", reason: "upstream_redirect"}]; got != 0 {
+		t.Fatalf("redirect bypasses = %d, want 0", got)
+	}
+}
+
+// A hop varying on a header the cache key does not carry must still be refused.
+func TestProxyDoesNotCacheRedirectWhoseHopVariesOnAnotherHeader(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "selected-by-header")
+	}))
+	defer final.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Vary", "x-selector")
+		http.Redirect(w, request, final.URL+"/artifact", http.StatusSeeOther)
+	}))
+	defer upstream.Close()
+	store := newMemoryArtifactStore()
+	metrics := newTestCacheMetrics()
+	proxy := newTestCachingProxy(t, store, metrics, 1024)
+	route := testNPMRoute(upstream.URL)
+	route.EnforceRedirectOrigins = true
+	route.AllowedRedirectOrigins = []string{final.URL}
+
+	recorder := httptest.NewRecorder()
+	if _, err := proxy.Serve(recorder, httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil), route, exactArtifactInfo()); err != nil {
+		t.Fatal(err)
+	}
+	if store.putCalls != 0 {
+		t.Fatalf("cache put calls = %d, want 0", store.putCalls)
+	}
+	if got := metrics.bypasses[bypassMetricKey{route: "npm", reason: "upstream_redirect"}]; got != 1 {
+		t.Fatalf("redirect bypasses = %d, want 1", got)
+	}
 }

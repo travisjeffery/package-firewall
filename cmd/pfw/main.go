@@ -169,6 +169,7 @@ func run(args []string) error {
 			BearerToken:        bearerToken,
 			BasicUsername:      basicUsername,
 			BasicPassword:      basicPassword,
+			Progress:           os.Stderr,
 		}, manifest.Artifacts, os.Stdout)
 	default:
 		return usage()

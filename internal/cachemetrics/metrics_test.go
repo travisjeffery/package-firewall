@@ -9,6 +9,7 @@ import (
 
 func TestMetricsExposeRequiredCacheOutcomes(t *testing.T) {
 	metrics := New()
+	metrics.Request("npm", http.StatusOK)
 	metrics.Hit("npm")
 	metrics.Miss("npm")
 	metrics.StoreError("npm")
@@ -31,6 +32,7 @@ func TestMetricsExposeRequiredCacheOutcomes(t *testing.T) {
 		t.Fatalf("content type = %q", got)
 	}
 	for _, line := range []string{
+		`package_firewall_http_requests_total{route="npm",status="200"} 1`,
 		`package_firewall_cache_hits_total{route="npm"} 1`,
 		`package_firewall_cache_misses_total{route="npm"} 1`,
 		`package_firewall_cache_store_errors_total{route="npm"} 1`,

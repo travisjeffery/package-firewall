@@ -1,13 +1,16 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -285,11 +288,86 @@ func TestServerDoesNotOverwriteStartedUpstreamResponse(t *testing.T) {
 			}, nil
 		})}),
 	)
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil)
-	server.routesHandler().ServeHTTP(recorder, request)
+	recorder := serveAborted(t, server.routesHandler(), httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil))
 	if recorder.Code != http.StatusOK || recorder.Body.String() != "partial" {
 		t.Fatalf("status = %d body = %q", recorder.Code, recorder.Body.String())
+	}
+	metrics := httptest.NewRecorder()
+	server.metrics.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(metrics.Body.String(), `package_firewall_http_requests_total{route="npm",status="502"} 1`) {
+		t.Fatalf("metrics did not classify the failed transfer:\n%s", metrics.Body.String())
+	}
+}
+
+func TestServerCountsCanceledTransferAfterHeadersAs499(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Routes = []config.RouteConfig{{
+		Name:        "npm",
+		Ecosystem:   "npm",
+		PathPrefix:  "/npm/",
+		UpstreamURL: "https://registry.example/",
+	}}
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(cfg, engine, intel.NoopProvider{})
+	server.proxy = proxy.New(
+		cfg.Server.PublicBaseURL,
+		proxy.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(io.MultiReader(strings.NewReader("partial"), errorReader{err: context.Canceled})),
+				Request:    request,
+			}, nil
+		})}),
+	)
+	serveAborted(t, server.routesHandler(), httptest.NewRequest(http.MethodGet, "/npm/pkg/-/pkg-1.0.0.tgz", nil))
+	metrics := httptest.NewRecorder()
+	server.metrics.Handler().ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(metrics.Body.String(), `package_firewall_http_requests_total{route="npm",status="499"} 1`) {
+		t.Fatalf("metrics did not classify the canceled transfer:\n%s", metrics.Body.String())
+	}
+}
+
+// Rewritten metadata streams without a Content-Length, so ending the response
+// normally after an upstream failure would hand npm a cut-off packument as a whole one.
+func TestServerAbortsRewrittenMetadataThatFailsMidBody(t *testing.T) {
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Routes = []config.RouteConfig{{
+		Name:        "npm",
+		Ecosystem:   "npm",
+		PathPrefix:  "/npm/",
+		UpstreamURL: "https://registry.example/",
+	}}
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(cfg, engine, intel.NoopProvider{})
+	server.proxy = proxy.New(
+		cfg.Server.PublicBaseURL,
+		proxy.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(io.MultiReader(strings.NewReader(`{"versions":{"1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"}}`), failingReader{})),
+				Request:    request,
+			}, nil
+		})}),
+	)
+	front := httptest.NewServer(server.routesHandler())
+	defer front.Close()
+	response, err := http.Get(front.URL + "/npm/pkg")
+	if err != nil {
+		return // the abort landed before the buffered status line was flushed
+	}
+	defer response.Body.Close()
+	if body, err := io.ReadAll(response.Body); err == nil {
+		t.Fatalf("client read a complete %d response %q from a failed upstream transfer", response.StatusCode, body)
 	}
 }
 
@@ -384,6 +462,63 @@ func TestConfiguredMissingBearerDeniesRequests(t *testing.T) {
 	}
 }
 
+func TestServerAdvertisesConfiguredAuthenticationSchemes(t *testing.T) {
+	t.Setenv("PFW_TEST_CHALLENGE_BEARER", "bearer-secret")
+	t.Setenv("PFW_TEST_CHALLENGE_USER", "alice")
+	t.Setenv("PFW_TEST_CHALLENGE_PASS", "password")
+
+	tests := []struct {
+		name       string
+		configure  func(*config.Config)
+		challenges []string
+	}{
+		{
+			name: "basic",
+			configure: func(cfg *config.Config) {
+				cfg.Auth.BasicUsernameEnv = "PFW_TEST_CHALLENGE_USER"
+				cfg.Auth.BasicPasswordEnv = "PFW_TEST_CHALLENGE_PASS"
+			},
+			challenges: []string{`Basic realm="package-firewall"`},
+		},
+		{
+			name: "bearer",
+			configure: func(cfg *config.Config) {
+				cfg.Auth.BearerTokenEnv = "PFW_TEST_CHALLENGE_BEARER"
+			},
+			challenges: []string{`Bearer realm="package-firewall"`},
+		},
+		{
+			name: "basic and bearer",
+			configure: func(cfg *config.Config) {
+				cfg.Auth.BasicUsernameEnv = "PFW_TEST_CHALLENGE_USER"
+				cfg.Auth.BasicPasswordEnv = "PFW_TEST_CHALLENGE_PASS"
+				cfg.Auth.BearerTokenEnv = "PFW_TEST_CHALLENGE_BEARER"
+			},
+			challenges: []string{`Basic realm="package-firewall"`, `Bearer realm="package-firewall"`},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			engine, err := policy.New(policy.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Default()
+			test.configure(&cfg)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/npm/pkg", nil)
+			New(cfg, engine, intel.NoopProvider{}).routesHandler().ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+			}
+			if challenges := recorder.Header().Values("WWW-Authenticate"); !slices.Equal(challenges, test.challenges) {
+				t.Fatalf("WWW-Authenticate = %q want %q", challenges, test.challenges)
+			}
+		})
+	}
+}
+
 func TestPartialBasicSecretDoesNotAcceptEmptyPeer(t *testing.T) {
 	t.Setenv("PFW_TEST_BASIC_USER", "alice")
 	_ = os.Unsetenv("PFW_TEST_BASIC_PASS")
@@ -431,8 +566,187 @@ func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, 
 	return function(request)
 }
 
+// serveAborted serves a request whose body fails after the status line went out,
+// requires the handler to abort it, and returns what had reached the client.
+func serveAborted(t *testing.T, handler http.Handler, request *http.Request) (recorder *httptest.ResponseRecorder) {
+	t.Helper()
+	recorder = httptest.NewRecorder()
+	defer func() {
+		if recovered := recover(); recovered != http.ErrAbortHandler {
+			t.Fatalf("recovered %v, want http.ErrAbortHandler", recovered)
+		}
+	}()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) {
 	return 0, errors.New("upstream body read failed")
+}
+
+type errorReader struct {
+	err error
+}
+
+func (reader errorReader) Read([]byte) (int, error) {
+	return 0, reader.err
+}
+
+// The build-asset routes are fetched by the Gradle wrapper and by Docker builds
+// before any authenticated setup has run, so they must answer without credentials
+// while every package route stays closed.
+func anonymousBuildAssetConfig(t *testing.T, upstreamURL string) config.Config {
+	t.Helper()
+	t.Setenv("PFW_TEST_ANON_USER", "alice")
+	t.Setenv("PFW_TEST_ANON_PASS", "s3cret")
+	cfg := config.Default()
+	cfg.Server.PublicBaseURL = "http://firewall.test"
+	cfg.Auth.BasicUsernameEnv = "PFW_TEST_ANON_USER"
+	cfg.Auth.BasicPasswordEnv = "PFW_TEST_ANON_PASS"
+	cfg.Routes = []config.RouteConfig{
+		{
+			Name:        "npm",
+			Ecosystem:   "npm",
+			PathPrefix:  "/npm/",
+			UpstreamURL: upstreamURL + "/",
+		},
+		{
+			Name:           "build-assets",
+			Ecosystem:      "static",
+			PathPrefix:     "/build-assets/gradle/",
+			UpstreamURL:    upstreamURL + "/",
+			AllowAnonymous: true,
+		},
+	}
+	return cfg
+}
+
+func TestAnonymousRouteServesWithoutCredentials(t *testing.T) {
+	upstreamHit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("zip"))
+	}))
+	defer upstream.Close()
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := anonymousBuildAssetConfig(t, upstream.URL)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/build-assets/gradle/gradle-9.1.0-bin.zip", nil)
+	New(cfg, engine, intel.NoopProvider{}).routesHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !upstreamHit {
+		t.Fatal("anonymous build-asset request never reached the upstream")
+	}
+}
+
+func TestAnonymousRouteDoesNotOpenAuthenticatedRoutes(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("authenticated route reached the upstream without credentials")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	engine, err := policy.New(policy.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := anonymousBuildAssetConfig(t, upstream.URL)
+	handler := New(cfg, engine, intel.NoopProvider{}).routesHandler()
+
+	// A package route on the same server keeps its credential requirement.
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/npm/lodash", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("npm status = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	// An unmatched path answers 401 rather than 404: routing now runs first, and
+	// a 404 here would tell an anonymous caller which prefixes this server serves.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/build-assets/nope/x.zip", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unmatched status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A cancelled client must not be logged as a proxy failure. Package managers abort
+// parallel fetches constantly, and at ERROR those lines drown out real upstream faults.
+func TestServerLogsClientCancellationBelowError(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		upstream      error
+		clientAborted bool
+		wantLevel     slog.Level
+		wantMsg       string
+	}{
+		{"client cancelled", context.Canceled, true, slog.LevelDebug, "proxy_client_disconnected"},
+		{"genuine upstream failure", errors.New("dial tcp: connection refused"), false, slog.LevelError, "proxy_failed"},
+		// Cache-fill coordination cancels a context derived from this request when a lease
+		// renewal fails. The client is still connected, so this must stay an ERROR.
+		{"internal cancellation with live client", context.Canceled, false, slog.LevelError, "proxy_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Server.PublicBaseURL = "http://firewall.test"
+			cfg.Routes = []config.RouteConfig{{
+				Name:        "npm",
+				Ecosystem:   "npm",
+				PathPrefix:  "/npm/",
+				UpstreamURL: "https://registry.example/",
+			}}
+			engine, err := policy.New(policy.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := New(cfg, engine, intel.NoopProvider{})
+			var logs bytes.Buffer
+			server.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			server.proxy = proxy.New(
+				cfg.Server.PublicBaseURL,
+				proxy.WithHTTPClient(&http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return nil, tc.upstream
+				})}),
+			)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/npm/pkg", nil)
+			if tc.clientAborted {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
+			server.routesHandler().ServeHTTP(recorder, request)
+
+			var sawWanted bool
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				if line == "" {
+					continue
+				}
+				var record map[string]any
+				if err := json.Unmarshal([]byte(line), &record); err != nil {
+					t.Fatalf("log line is not JSON: %q", line)
+				}
+				level, _ := record["level"].(string)
+				msg, _ := record["msg"].(string)
+				if msg == tc.wantMsg {
+					sawWanted = true
+					if level != tc.wantLevel.String() {
+						t.Fatalf("%s logged at %s, want %s", msg, level, tc.wantLevel)
+					}
+				}
+				if tc.wantLevel != slog.LevelError && level == slog.LevelError.String() {
+					t.Fatalf("unexpected ERROR line for a cancelled client: %q", line)
+				}
+			}
+			if !sawWanted {
+				t.Fatalf("no %q record; logs were:\n%s", tc.wantMsg, logs.String())
+			}
+		})
+	}
 }

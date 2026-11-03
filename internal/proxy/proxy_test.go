@@ -54,6 +54,120 @@ func TestProxyRewritesPyPIFileURLs(t *testing.T) {
 	}
 }
 
+func TestProxyRewritesPyPIIndexWhenClientAcceptsGzip(t *testing.T) {
+	var upstreamEncoding string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamEncoding = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "application/vnd.pypi.simple.v1+json")
+		_, _ = w.Write([]byte(`{"files":[{"url":"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl"}]}`))
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{Name: "pypi", Ecosystem: "pypi", PathPrefix: "/pypi/", UpstreamURL: upstream.URL + "/"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/pypi/simple/six/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	if _, err := p.Serve(rec, req, route, registry.RequestInfo{UpstreamPath: "/simple/six/"}); err != nil {
+		t.Fatal(err)
+	}
+	if upstreamEncoding != "identity" {
+		t.Fatalf("upstream Accept-Encoding = %q, want identity", upstreamEncoding)
+	}
+	if strings.Contains(rec.Body.String(), "files.pythonhosted.org") {
+		t.Fatalf("download URL escaped the firewall: %s", rec.Body.String())
+	}
+}
+
+func TestProxyRefusesSplitContentEncodingFields(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Add("Content-Encoding", "identity")
+		w.Header().Add("Content-Encoding", "gzip")
+		_, _ = w.Write([]byte("not really gzip"))
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{Name: "pypi", Ecosystem: "pypi", PathPrefix: "/pypi/", UpstreamURL: upstream.URL + "/"}
+	_, err := p.Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/pypi/simple/six/", nil), route, registry.RequestInfo{UpstreamPath: "/simple/six/"})
+	if !errors.Is(err, errEncodedRewriteBody) {
+		t.Fatalf("err = %v, want errEncodedRewriteBody", err)
+	}
+}
+
+func TestProxyKeepsClientEncodingNegotiationForArtifacts(t *testing.T) {
+	var upstreamEncoding string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamEncoding = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("wheel"))
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{Name: "pypi", Ecosystem: "pypi", PathPrefix: "/pypi/", UpstreamURL: upstream.URL + "/", FileUpstreamURL: upstream.URL + "/"}
+	req := httptest.NewRequest(http.MethodGet, "/pypi/files/packages/six-1.17.0-py2.py3-none-any.whl", nil)
+	req.Header.Set("Accept-Encoding", "gzip, identity;q=0")
+	info := registry.RequestInfo{Kind: "artifact", FileUpstream: true, UpstreamPath: "/packages/six-1.17.0-py2.py3-none-any.whl"}
+	if _, err := p.Serve(httptest.NewRecorder(), req, route, info); err != nil {
+		t.Fatal(err)
+	}
+	if upstreamEncoding != "gzip, identity;q=0" {
+		t.Fatalf("upstream Accept-Encoding = %q, want the client's", upstreamEncoding)
+	}
+}
+
+func TestIdentityContentEncoding(t *testing.T) {
+	for _, tt := range []struct {
+		values []string
+		ok     bool
+	}{
+		{nil, true},
+		{[]string{"identity"}, true},
+		{[]string{"Identity, identity"}, true},
+		{[]string{"gzip"}, false},
+		{[]string{"identity", "gzip"}, false},
+		{[]string{"identity, br"}, false},
+	} {
+		if _, ok := identityContentEncoding(tt.values); ok != tt.ok {
+			t.Errorf("%v: ok = %v, want %v", tt.values, ok, tt.ok)
+		}
+	}
+}
+
+func TestProxyRewritesAbbreviatedNPMMetadata(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.npm.install-v1+json")
+		_, _ = w.Write([]byte(`{"versions":{"1.9.0":{"dist":{"tarball":"https://registry.npmjs.org/shell-quote/-/shell-quote-1.9.0.tgz"}}}}`))
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{Name: "npm", Ecosystem: "npm", PathPrefix: "/npm/", UpstreamURL: upstream.URL + "/"}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/npm/shell-quote", nil)
+	req.Header.Set("Accept", "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*")
+	if _, err := p.Serve(rec, req, route, registry.RequestInfo{UpstreamPath: "/shell-quote"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), `"tarball":"http://firewall.test/npm/shell-quote/-/shell-quote-1.9.0.tgz"`) {
+		t.Fatalf("tarball URL escaped the firewall: %s", rec.Body.String())
+	}
+}
+
+func TestProxyRefusesEncodedBodyItCannotRewrite(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write([]byte("not really gzip"))
+	}))
+	defer upstream.Close()
+	p := New("http://firewall.test")
+	route := config.RouteConfig{Name: "pypi", Ecosystem: "pypi", PathPrefix: "/pypi/", UpstreamURL: upstream.URL + "/"}
+	rec := httptest.NewRecorder()
+	_, err := p.Serve(rec, httptest.NewRequest(http.MethodGet, "/pypi/simple/six/", nil), route, registry.RequestInfo{UpstreamPath: "/simple/six/"})
+	if !errors.Is(err, errEncodedRewriteBody) {
+		t.Fatalf("err = %v, want errEncodedRewriteBody", err)
+	}
+}
+
 func TestUpstreamURLRejectsUnsafePathSegments(t *testing.T) {
 	route := config.RouteConfig{UpstreamURL: "https://registry.example/repository/npm/"}
 	for _, upstreamPath := range []string{

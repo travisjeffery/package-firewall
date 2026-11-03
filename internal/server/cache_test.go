@@ -75,6 +75,9 @@ func TestPolicyAndIntelRunBeforeEveryCacheHit(t *testing.T) {
 	if !strings.Contains(metricsRecorder.Body.String(), `package_firewall_cache_hits_total{route="npm"} 2`) {
 		t.Fatalf("metrics did not expose cache hits:\n%s", metricsRecorder.Body.String())
 	}
+	if !strings.Contains(metricsRecorder.Body.String(), `package_firewall_http_requests_total{route="npm",status="200"} 2`) {
+		t.Fatalf("metrics did not expose HTTP responses:\n%s", metricsRecorder.Body.String())
+	}
 }
 
 func TestBlockingPolicyRunsBeforeCacheLookup(t *testing.T) {

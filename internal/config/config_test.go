@@ -247,6 +247,42 @@ func TestValidateAllowedRedirectOrigins(t *testing.T) {
 	}
 }
 
+func TestValidateRouteMetricNames(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		want      string
+	}{
+		{
+			name: "reserved prefix",
+			configure: func(cfg *Config) {
+				cfg.Routes[0].Name = "__auth__"
+			},
+			want: "uses reserved prefix __",
+		},
+		{
+			name: "duplicate name",
+			configure: func(cfg *Config) {
+				route := cfg.Routes[0]
+				route.PathPrefix = "/duplicate/"
+				cfg.Routes = append(cfg.Routes, route)
+			},
+			want: "duplicate route name",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			test.configure(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsMissingConfiguredAuthSecrets(t *testing.T) {
 	_ = os.Unsetenv("PFW_TEST_BEARER_TOKEN")
 	dir := t.TempDir()
@@ -418,6 +454,40 @@ func TestLoadRejectsInvalidCacheEnvironmentValues(t *testing.T) {
 			t.Setenv(name, "not-a-duration")
 			if _, err := Load(""); err == nil || !strings.Contains(err.Error(), name) {
 				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAllowAnonymousRequiresStaticEcosystem(t *testing.T) {
+	tests := []struct {
+		name      string
+		ecosystem string
+		wantError string
+	}{
+		{name: "static", ecosystem: "static"},
+		{name: "maven", ecosystem: "maven", wantError: "allow_anonymous requires ecosystem"},
+		{name: "npm", ecosystem: "npm", wantError: "allow_anonymous requires ecosystem"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Routes = []RouteConfig{{
+				Name:           "assets",
+				Ecosystem:      test.ecosystem,
+				PathPrefix:     "/build-assets/gradle/",
+				UpstreamURL:    "https://services.gradle.org/distributions/",
+				AllowAnonymous: true,
+			}}
+			err := cfg.Validate()
+			if test.wantError == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("error = %v want containing %q", err, test.wantError)
 			}
 		})
 	}

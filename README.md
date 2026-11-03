@@ -72,7 +72,7 @@ allow:
   - "pkg:golang/golang.org/x/mod@v0.30.0"
 ```
 
-Explicit deny rules take precedence over allow and warn rules. Explicit allow rules skip OSV checks. Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy and skips OSV; canonical versioned metadata is cached as immutable, while mutable selectors are not. `.zip` module archives remain evaluated.
+Explicit deny rules take precedence over allow and warn rules. Explicit allow and warn rules decide vulnerabilities themselves, but still block malicious packages (below). Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy and skips OSV; canonical versioned metadata is cached as immutable, while mutable selectors are not. `.zip` module archives remain evaluated.
 
 `cooldown` blocks a version until `min_age` after it was published:
 
@@ -136,8 +136,16 @@ and a failed vulnerability lookup when intel errors fail closed.
 
 A `MAL-` record (or an advisory that aliases one) is always blocked: these
 records carry no CVSS score, so `vulnerability_block_threshold` and
-`default_vulnerability_action` do not apply to them. Only an explicit `allow`
-policy rule, which is evaluated before vulnerability intel, can let one through.
+`default_vulnerability_action` do not apply to them, and neither does a
+matching `warn` rule or a wildcard `allow` rule. The only way to serve one,
+for a verified false positive, is an `allow` rule naming the exact version
+(`pkg:npm/name@1.2.3`, no `*` or `?`), which skips OSV entirely; a wildcard
+would also exempt the next, possibly compromised, release.
+
+Withdrawn OSV records are ignored. A malicious result is kept for seven days
+past the OSV cache TTL and used when OSV is unreachable, so
+`fail_open_intel_errors` cannot serve a package already seen to be malicious;
+the next successful OSV answer replaces it.
 
 ## CLI
 

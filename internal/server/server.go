@@ -360,11 +360,11 @@ func (s *Server) decide(ctx context.Context, route config.RouteConfig, info regi
 		policyDecision = s.policy.Evaluate(info.Package)
 	}
 	switch policyDecision.Action {
-	case policy.ActionBlock, policy.ActionWarn, policy.ActionMonitor:
+	case policy.ActionBlock:
 		return policyDecision
-	case policy.ActionAllow:
+	case policy.ActionWarn, policy.ActionMonitor, policy.ActionAllow:
 		if policyDecision.MatchedRule != "" {
-			return policyDecision
+			return s.ruleDecision(ctx, info, policyDecision)
 		}
 	case policy.ActionUnknown:
 		if s.cfg.Decision.FailOpenUnknownPackage {
@@ -384,6 +384,22 @@ func (s *Server) decide(ctx context.Context, route config.RouteConfig, info regi
 		return policy.Decision{Action: policy.ActionAllow, Reason: "policy and intel allowed package"}
 	}
 	return intelDecision
+}
+
+// ruleDecision honours a matched warn or allow rule for everything except
+// malware, which only an exact-version allow rule exempts.
+func (s *Server) ruleDecision(ctx context.Context, info registry.RequestInfo, ruled policy.Decision) policy.Decision {
+	if ruled.ExemptsMalware() || info.SkipVulnerabilityCheck {
+		return ruled
+	}
+	result, err := s.intel.Query(ctx, info.Package)
+	if err != nil {
+		return s.lookupFailed("intel", err)
+	}
+	if malware, ok := intel.MalwareDecision(result, s.cfg.Decision.VulnerabilityBlockThreshold); ok {
+		return malware
+	}
+	return ruled
 }
 
 func (s *Server) lookupFailed(what string, err error) policy.Decision {

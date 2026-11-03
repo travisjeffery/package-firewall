@@ -76,10 +76,15 @@ func run(args []string) error {
 		}
 		pkg := packageFromInput(*ecosystem, *name, *version)
 		decision := engine.Evaluate(pkg)
-		if decision.Action == policy.ActionAllow && decision.MatchedRule == "" && cfg.Intel.OSV.Enabled {
+		checkIntel := decision.Action != policy.ActionBlock && decision.Action != policy.ActionUnknown && !decision.ExemptsMalware()
+		if checkIntel && cfg.Intel.OSV.Enabled {
 			result, err := intel.NewOSVProvider(cfg.Intel.OSV.APIURL, cfg.Intel.OSV.Timeout.Std(), cfg.Intel.OSV.CacheTTL.Std()).Query(context.Background(), pkg)
 			if err == nil {
-				decision = intel.Decide(result, policy.Action(cfg.Decision.DefaultVulnerabilityAction), cfg.Decision.VulnerabilityBlockThreshold)
+				if malware, ok := intel.MalwareDecision(result, cfg.Decision.VulnerabilityBlockThreshold); ok {
+					decision = malware
+				} else if decision.MatchedRule == "" {
+					decision = intel.Decide(result, policy.Action(cfg.Decision.DefaultVulnerabilityAction), cfg.Decision.VulnerabilityBlockThreshold)
+				}
 			}
 		}
 		fmt.Printf("%s\t%s\t%s\n", decision.Action, pkg.PURL, decision.Reason)

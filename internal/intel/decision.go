@@ -13,15 +13,8 @@ func Decide(result Result, defaultAction policy.Action, blockThreshold float64) 
 	}
 	// Malicious-package records carry no CVSS score, so neither the threshold
 	// nor the default action may decide them.
-	for _, finding := range result.Findings {
-		if malicious(finding) {
-			return policy.Decision{
-				Action:   policy.ActionBlock,
-				Reason:   "malicious package " + finding.ID,
-				Kind:     policy.KindMalware,
-				Advisory: advisory(finding, blockThreshold),
-			}
-		}
+	if decision, ok := MalwareDecision(result, blockThreshold); ok {
+		return decision
 	}
 	var blocking *Finding
 	for i, finding := range result.Findings {
@@ -56,6 +49,21 @@ func Decide(result Result, defaultAction policy.Action, blockThreshold float64) 
 		Kind:     findingKind(worst),
 		Advisory: advisory(worst, blockThreshold),
 	}
+}
+
+// MalwareDecision returns the block for the first malicious finding, if any.
+func MalwareDecision(result Result, blockThreshold float64) (policy.Decision, bool) {
+	for _, finding := range result.Findings {
+		if malicious(finding) {
+			return policy.Decision{
+				Action:   policy.ActionBlock,
+				Reason:   "malicious package " + finding.ID,
+				Kind:     policy.KindMalware,
+				Advisory: advisory(finding, blockThreshold),
+			}, true
+		}
+	}
+	return policy.Decision{}, false
 }
 
 // OSV publishes the OpenSSF malicious-packages feed under the MAL- prefix.

@@ -54,6 +54,12 @@ func (c *Cache[T]) Set(key string, value T, ttl time.Duration) {
 	c.enforceMaxEntries()
 }
 
+func (c *Cache[T]) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.delete(key)
+}
+
 func (c *Cache[T]) Purge() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

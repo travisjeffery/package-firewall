@@ -54,6 +54,10 @@ func shellQuoteServer(t *testing.T) (http.Handler, *fixedProvider) {
 			Affected: []string{"<1.11.0"},
 			Fixed:    []string{"1.11.0"},
 		}},
+		"pkg:npm/flatmap-stream@0.1.1": {{
+			ID:      "MAL-2025-20690",
+			Summary: "Malicious code in flatmap-stream (npm)",
+		}},
 	}}
 	return New(cfg, engine, provider).routesHandler(), provider
 }
@@ -105,6 +109,28 @@ func TestBlockedResponseExplainsTheAdvisory(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Package-Firewall-Reason"); !strings.HasPrefix(got, "Blocked by Package Firewall: shell-quote@1.9.0 has GHSA") {
 		t.Errorf("reason header = %q", got)
+	}
+}
+
+func TestMaliciousPackageIsBlockedUnderTheDefaultWarnAction(t *testing.T) {
+	handler, _ := shellQuoteServer(t)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, authed(httptest.NewRequest(http.MethodGet, "/npm/flatmap-stream/-/flatmap-stream-0.1.1.tgz", nil)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Reason      string              `json:"reason"`
+		Explanation explain.Explanation `json:"explanation"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Reason != "malicious package MAL-2025-20690" || body.Explanation.Kind != "malware" {
+		t.Fatalf("body = %+v", body)
+	}
+	if !strings.Contains(body.Explanation.Message, "known malicious package (MAL-2025-20690)") {
+		t.Errorf("message = %q", body.Explanation.Message)
 	}
 }
 

@@ -72,7 +72,23 @@ allow:
   - "pkg:golang/golang.org/x/mod@v0.30.0"
 ```
 
-Explicit deny rules take precedence over allow and warn rules. Explicit allow rules skip OSV checks. Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy and skips OSV; canonical versioned metadata is cached as immutable, while mutable selectors are not. `.zip` module archives remain evaluated.
+Explicit deny rules take precedence over allow and warn rules. Explicit allow and warn rules decide vulnerabilities themselves, but still block malicious packages (below). Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy and skips OSV; canonical versioned metadata is cached as immutable, while mutable selectors are not. `.zip` module archives remain evaluated.
+
+`cooldown` blocks a version until `min_age` after it was published:
+
+```yaml
+cooldown:
+  enabled: true
+  min_age: 24h
+```
+
+The publish time is looked up from the route's upstream only when no rule
+matched and the cooldown is enabled. npm uses the packument's `time`, PyPI
+the requested file's `upload-time` from the JSON simple index (PEP 691/700),
+so a new file on an old release is held too, Go the version's `.info` `Time`,
+and Maven the artifact's `Last-Modified`. Lookups are cached; a failed lookup
+follows `decision.fail_open_intel_errors`. Static routes have no publish time
+and are not held.
 
 ## Why was my install blocked?
 
@@ -117,6 +133,21 @@ or replace the dependency when none is published), an OSV `MAL-` malicious
 package (remove it and treat the machine as compromised), a deny rule, the
 release cooldown (allowed after a given time), an unidentifiable artifact path,
 and a failed vulnerability lookup when intel errors fail closed.
+
+A malicious package is always blocked: an OSV `MAL-` record, an advisory that
+aliases one, or a GitHub advisory tagged CWE-506 (embedded malicious code),
+which often has neither a `MAL-` record nor a severity. These records usually
+carry no CVSS score, so `vulnerability_block_threshold` and
+`default_vulnerability_action` do not apply to them, and neither does a
+matching `warn` rule or a wildcard `allow` rule. The only way to serve one,
+for a verified false positive, is an `allow` rule naming the exact version
+(`pkg:npm/name@1.2.3`, no `*` or `?`), which skips OSV entirely; a wildcard
+would also exempt the next, possibly compromised, release.
+
+Withdrawn OSV records are ignored. A malicious result is kept for seven days
+past the OSV cache TTL and used when OSV is unreachable, so
+`fail_open_intel_errors` cannot serve a package already seen to be malicious;
+the next successful OSV answer replaces it.
 
 ## CLI
 

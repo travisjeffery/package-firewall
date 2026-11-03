@@ -156,6 +156,18 @@ func New(cfg Config) (*Engine, error) {
 	return &Engine{rules: rules, cooldown: cfg.Cooldown}, errors.Join(errs...)
 }
 
+// ExemptsMalware reports whether the decision came from an allow rule naming
+// one exact version. Only such a rule may serve a known malicious package: a
+// wildcard would also exempt its next, possibly compromised, release.
+func (d Decision) ExemptsMalware() bool {
+	return d.Action == ActionAllow && d.MatchedRule != "" && !strings.ContainsAny(d.MatchedRule, "*?")
+}
+
+// CooldownEnabled reports whether Evaluate needs Package.PublishedAt.
+func (e *Engine) CooldownEnabled() bool {
+	return e.cooldown.Enabled
+}
+
 func (e *Engine) Evaluate(pkg Package) Decision {
 	if pkg.PURL == "" {
 		return Decision{Action: ActionUnknown, Reason: "package version could not be identified", Kind: KindUnknownPackage}

@@ -27,19 +27,27 @@ const (
 
 const defaultOSVCacheEntries = 4096
 
+// A malicious result outlives the cache TTL so that an OSV outage after expiry,
+// with fail_open_intel_errors set, cannot serve a package already known to be
+// malicious. A later successful query replaces it, so a withdrawn record
+// stops blocking as soon as OSV answers.
+const maliciousRetention = 7 * 24 * time.Hour
+
 type OSVProvider struct {
-	apiURL string
-	client *http.Client
-	cache  *cache.Cache[Result]
-	ttl    time.Duration
+	apiURL    string
+	client    *http.Client
+	cache     *cache.Cache[Result]
+	malicious *cache.Cache[Result]
+	ttl       time.Duration
 }
 
 func NewOSVProvider(apiURL string, timeout time.Duration, ttl time.Duration) *OSVProvider {
 	return &OSVProvider{
-		apiURL: apiURL,
-		client: &http.Client{Timeout: timeout},
-		cache:  cache.NewWithMaxEntries[Result](defaultOSVCacheEntries),
-		ttl:    ttl,
+		apiURL:    apiURL,
+		client:    &http.Client{Timeout: timeout},
+		cache:     cache.NewWithMaxEntries[Result](defaultOSVCacheEntries),
+		malicious: cache.NewWithMaxEntries[Result](defaultOSVCacheEntries),
+		ttl:       ttl,
 	}
 }
 
@@ -52,8 +60,25 @@ func (p *OSVProvider) Query(ctx context.Context, pkg policy.Package) (Result, er
 	if cached, ok := p.cache.Get(key); ok {
 		return cached, nil
 	}
+	result, err := p.fetch(ctx, ecosystem, name, pkg.Version)
+	if err != nil {
+		if known, ok := p.malicious.Get(key); ok {
+			return known, nil
+		}
+		return Result{}, err
+	}
+	p.cache.Set(key, result, p.ttl)
+	if _, ok := MalwareDecision(result, 0); ok {
+		p.malicious.Set(key, result, maliciousRetention)
+	} else {
+		p.malicious.Delete(key)
+	}
+	return result, nil
+}
+
+func (p *OSVProvider) fetch(ctx context.Context, ecosystem, name, version string) (Result, error) {
 	body, err := json.Marshal(osvQuery{
-		Version: pkg.Version,
+		Version: version,
 		Package: osvPackageRef{
 			Name:      name,
 			Ecosystem: ecosystem,
@@ -82,20 +107,25 @@ func (p *OSVProvider) Query(ctx context.Context, pkg policy.Package) (Result, er
 	}
 	result := Result{Findings: make([]Finding, 0, len(decoded.Vulns))}
 	for _, vuln := range decoded.Vulns {
+		// OSV drops withdrawn records from its version index, but a mirror or a
+		// record withdrawn mid-ingestion may still return one.
+		if vuln.Withdrawn != nil && !vuln.Withdrawn.After(time.Now()) {
+			continue
+		}
 		affected, fixed := affectedRanges(vuln.Affected, ecosystem, name)
 		if semverOrdered(ecosystem) {
-			fixed = fixesAfter(fixed, pkg.Version)
+			fixed = fixesAfter(fixed, version)
 		}
 		result.Findings = append(result.Findings, Finding{
 			ID:       vuln.ID,
 			Aliases:  vuln.Aliases,
+			CWEs:     vuln.DatabaseSpecific.CWEIDs,
 			Summary:  vuln.Summary,
 			Severity: maxSeverity(vuln.Severity),
 			Affected: affected,
 			Fixed:    fixed,
 		})
 	}
-	p.cache.Set(key, result, p.ttl)
 	return result, nil
 }
 
@@ -300,11 +330,16 @@ type osvResponse struct {
 }
 
 type osvVulnerability struct {
-	ID       string        `json:"id"`
-	Aliases  []string      `json:"aliases"`
-	Summary  string        `json:"summary"`
-	Severity []osvSeverity `json:"severity"`
-	Affected []osvAffected `json:"affected"`
+	ID        string        `json:"id"`
+	Aliases   []string      `json:"aliases"`
+	Summary   string        `json:"summary"`
+	Severity  []osvSeverity `json:"severity"`
+	Affected  []osvAffected `json:"affected"`
+	Withdrawn *time.Time    `json:"withdrawn"`
+	// GitHub's advisories carry their CWEs here.
+	DatabaseSpecific struct {
+		CWEIDs []string `json:"cwe_ids"`
+	} `json:"database_specific"`
 }
 
 type osvAffected struct {

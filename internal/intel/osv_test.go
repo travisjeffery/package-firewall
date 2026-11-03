@@ -155,3 +155,88 @@ func TestOSVProviderKeepsMavenFixesThatSemVerWouldOrderEarlier(t *testing.T) {
 		t.Fatalf("fixed = %q, want the Maven service-pack fix kept", got)
 	}
 }
+
+func TestOSVProviderIgnoresWithdrawnRecords(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"vulns":[
+			{"id":"MAL-2026-1","withdrawn":"2026-01-02T00:00:00Z"},
+			{"id":"GHSA-live","withdrawn":"2999-01-01T00:00:00Z"},
+			{"id":"GHSA-kept"}]}`)
+	}))
+	defer server.Close()
+
+	result, err := NewOSVProvider(server.URL, time.Second, time.Minute).Query(context.Background(), policy.Package{Ecosystem: "npm", Name: "pkg", Version: "1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, finding := range result.Findings {
+		ids = append(ids, finding.ID)
+	}
+	if strings.Join(ids, ",") != "GHSA-live,GHSA-kept" {
+		t.Fatalf("findings = %v", ids)
+	}
+}
+
+func TestOSVProviderKeepsAKnownMaliciousResultThroughAnOutage(t *testing.T) {
+	var response string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if response == "" {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, response)
+	}))
+	defer server.Close()
+	provider := NewOSVProvider(server.URL, time.Second, time.Nanosecond)
+	query := func(name string) (Result, error) {
+		return provider.Query(context.Background(), policy.Package{Ecosystem: "npm", Name: name, Version: "1.0.0"})
+	}
+
+	response = `{"vulns":[{"id":"MAL-2026-1"}]}`
+	if _, err := query("evil"); err != nil {
+		t.Fatal(err)
+	}
+	response = `{"vulns":[{"id":"GHSA-ordinary"}]}`
+	if _, err := query("ordinary"); err != nil {
+		t.Fatal(err)
+	}
+
+	response = ""
+	result, err := query("evil")
+	if err != nil || len(result.Findings) != 1 || result.Findings[0].ID != "MAL-2026-1" {
+		t.Fatalf("result = %+v, err = %v; want the retained MAL finding", result, err)
+	}
+	if _, err := query("ordinary"); err == nil {
+		t.Fatal("an outage must still surface for packages with no malicious result")
+	}
+
+	response = `{"vulns":[]}`
+	if _, err := query("evil"); err != nil {
+		t.Fatal(err)
+	}
+	response = ""
+	if _, err := query("evil"); err == nil {
+		t.Fatal("a later clean answer must drop the retained malicious result")
+	}
+}
+
+// The shape OSV returns for coa@2.0.3: GitHub malware with no severity and no
+// MAL- alias, identified only by CWE-506.
+func TestOSVProviderBlocksUnscoredGitHubMalware(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"vulns":[{"id":"GHSA-73qr-pfmq-6rp8","summary":"Embedded malware in coa",
+			"database_specific":{"severity":"CRITICAL","github_reviewed":true,"cwe_ids":["CWE-506"]},
+			"affected":[{"package":{"name":"coa","ecosystem":"npm"},"versions":["2.0.3","2.0.4","2.1.1","2.1.3","3.0.1","3.1.3"]}]}]}`)
+	}))
+	defer server.Close()
+
+	result, err := NewOSVProvider(server.URL, time.Second, time.Minute).Query(context.Background(), policy.Package{Ecosystem: "npm", Name: "coa", Version: "2.0.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := Decide(result, policy.ActionWarn, 9.0)
+	if decision.Action != policy.ActionBlock || decision.Kind != policy.KindMalware || decision.Reason != "malicious package GHSA-73qr-pfmq-6rp8" {
+		t.Fatalf("decision = %+v", decision)
+	}
+}

@@ -11,6 +11,7 @@ type Finding struct {
 	Aliases  []string
 	Summary  string
 	Severity float64
+	CWEs     []string
 	// Affected and Fixed describe the ranges that apply to the queried package,
 	// as written by the advisory, e.g. ">=1.2.0, <1.11.0" and "1.11.0".
 	Affected []string

@@ -11,6 +11,18 @@ func Decide(result Result, defaultAction policy.Action, blockThreshold float64) 
 	if len(result.Findings) == 0 {
 		return policy.Decision{Action: policy.ActionAllow, Reason: "no vulnerability findings"}
 	}
+	// Malicious-package records carry no CVSS score, so neither the threshold
+	// nor the default action may decide them.
+	for _, finding := range result.Findings {
+		if malicious(finding) {
+			return policy.Decision{
+				Action:   policy.ActionBlock,
+				Reason:   "malicious package " + finding.ID,
+				Kind:     policy.KindMalware,
+				Advisory: advisory(finding, blockThreshold),
+			}
+		}
+	}
 	var blocking *Finding
 	for i, finding := range result.Findings {
 		if blockThreshold > 0 && finding.Severity >= blockThreshold && (blocking == nil || finding.Severity > blocking.Severity) {
@@ -47,8 +59,21 @@ func Decide(result Result, defaultAction policy.Action, blockThreshold float64) 
 }
 
 // OSV publishes the OpenSSF malicious-packages feed under the MAL- prefix.
-func findingKind(finding Finding) policy.BlockKind {
+// A GHSA malware advisory can be returned in place of the MAL- record it aliases.
+func malicious(finding Finding) bool {
 	if strings.HasPrefix(finding.ID, "MAL-") {
+		return true
+	}
+	for _, alias := range finding.Aliases {
+		if strings.HasPrefix(alias, "MAL-") {
+			return true
+		}
+	}
+	return false
+}
+
+func findingKind(finding Finding) policy.BlockKind {
+	if malicious(finding) {
 		return policy.KindMalware
 	}
 	return policy.KindVulnerability

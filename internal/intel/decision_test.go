@@ -1,6 +1,7 @@
 package intel
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/travisjeffery/package-firewall/internal/policy"
@@ -31,10 +32,29 @@ func TestDecideWarnsBelowThresholdWithTheWorstAdvisory(t *testing.T) {
 	}
 }
 
-func TestDecideLabelsMaliciousPackages(t *testing.T) {
-	decision := Decide(Result{Findings: []Finding{{ID: "MAL-2026-1", Severity: 10}}}, policy.ActionWarn, 9.0)
-	if decision.Kind != policy.KindMalware {
-		t.Fatalf("kind = %s", decision.Kind)
+// OSV malicious-package records carry no severity, so they score 0.
+func TestDecideBlocksMaliciousPackagesWhateverTheSeverityAndDefaultAction(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		findings  []Finding
+		action    policy.Action
+		threshold float64
+	}{
+		{"unscored under warn", []Finding{{ID: "MAL-2026-1"}}, policy.ActionWarn, 9.0},
+		{"unscored under monitor", []Finding{{ID: "MAL-2026-1"}}, policy.ActionMonitor, 9.0},
+		{"threshold disabled", []Finding{{ID: "MAL-2026-1"}}, policy.ActionWarn, 0},
+		{"behind a scored finding", []Finding{{ID: "GHSA-a", Severity: 9.8}, {ID: "MAL-2026-1"}}, policy.ActionWarn, 9.0},
+		{"GHSA aliasing a MAL record", []Finding{{ID: "GHSA-m", Aliases: []string{"MAL-2026-1"}}}, policy.ActionWarn, 9.0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := Decide(Result{Findings: tt.findings}, tt.action, tt.threshold)
+			if decision.Action != policy.ActionBlock || decision.Kind != policy.KindMalware {
+				t.Fatalf("decision = %+v", decision)
+			}
+			if decision.Advisory == nil || !strings.HasPrefix(decision.Reason, "malicious package ") {
+				t.Fatalf("decision = %+v", decision)
+			}
+		})
 	}
 }
 

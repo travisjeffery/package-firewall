@@ -25,12 +25,14 @@ import (
 	"github.com/travisjeffery/package-firewall/internal/policy"
 	"github.com/travisjeffery/package-firewall/internal/proxy"
 	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/package-firewall/internal/release"
 )
 
 type Server struct {
 	cfg         config.Config
 	policy      *policy.Engine
 	intel       intel.Provider
+	release     publishTimes
 	proxy       *proxy.Proxy
 	metrics     *cachemetrics.Metrics
 	audit       *audit.Logger
@@ -47,6 +49,10 @@ const (
 	authMetricsRoute      = "__auth__"
 	unmatchedMetricsRoute = "__unmatched__"
 )
+
+type publishTimes interface {
+	PublishedAt(ctx context.Context, route registry.Route, info registry.RequestInfo) (time.Time, error)
+}
 
 type RuntimeConfig struct {
 	Cache       proxy.CacheConfig
@@ -68,19 +74,18 @@ func New(cfg config.Config, policyEngine *policy.Engine, provider intel.Provider
 	}
 	runtimeConfig.Cache.Metrics = metrics
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	upstreamClient := proxy.NewHTTPClient(cfg.Upstream.RequestTimeout.Std(), cfg.Upstream.ResponseHeaderTimeout.Std())
 	bearer, bearerOK := secretFromEnv(cfg.Auth.BearerTokenEnv)
 	basicUser, basicUserOK := secretFromEnv(cfg.Auth.BasicUsernameEnv)
 	basicPass, basicPassOK := secretFromEnv(cfg.Auth.BasicPasswordEnv)
 	return &Server{
-		cfg:    cfg,
-		policy: policyEngine,
-		intel:  provider,
+		cfg:     cfg,
+		policy:  policyEngine,
+		intel:   provider,
+		release: release.NewResolver(upstreamClient),
 		proxy: proxy.New(
 			cfg.Server.PublicBaseURL,
-			proxy.WithHTTPClient(proxy.NewHTTPClient(
-				cfg.Upstream.RequestTimeout.Std(),
-				cfg.Upstream.ResponseHeaderTimeout.Std(),
-			)),
+			proxy.WithHTTPClient(upstreamClient),
 			proxy.WithCache(runtimeConfig.Cache),
 			proxy.WithCoordination(proxy.CoordinationConfig{
 				Coordinator:   runtimeConfig.Coordinator,
@@ -156,7 +161,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info := registry.Identify(toRegistryRoute(route), r.URL.Path)
-	decision := s.decide(r.Context(), info)
+	decision := s.decide(r.Context(), route, info)
 	event := audit.FromDecision(r, route.Name, info.Package, requestID, decision)
 	if decision.Action == policy.ActionBlock {
 		s.audit.Log(event)
@@ -237,7 +242,7 @@ func (s *Server) writeBlocked(w http.ResponseWriter, e explain.Explanation) {
 func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	requestID := requestID(r)
 	w.Header().Set("X-Request-ID", requestID)
-	info, anonymous, targetErr := s.explainTarget(r.URL.Query())
+	route, info, anonymous, targetErr := s.explainTarget(r.URL.Query())
 	// A URL on an anonymous route is explained without credentials, as the proxy
 	// serves it; anything else, including an invalid target, authenticates first
 	// so an anonymous caller learns nothing about which routes exist.
@@ -263,7 +268,7 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody("not_an_artifact", "the URL is registry metadata, which the firewall does not block", requestID))
 		return
 	}
-	e := explain.New(info.Package, s.decide(r.Context(), info), requestID, s.cfg.Decision.ExceptionsURL)
+	e := explain.New(info.Package, s.decide(r.Context(), route, info), requestID, s.cfg.Decision.ExceptionsURL)
 	if r.URL.Query().Get("format") == "text" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -273,30 +278,42 @@ func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, e)
 }
 
-func (s *Server) explainTarget(query url.Values) (registry.RequestInfo, bool, error) {
+func (s *Server) explainTarget(query url.Values) (config.RouteConfig, registry.RequestInfo, bool, error) {
 	if raw := query.Get("purl"); raw != "" {
 		pkg, err := registry.PackageFromPURL(raw)
 		if err != nil {
-			return registry.RequestInfo{}, false, err
+			return config.RouteConfig{}, registry.RequestInfo{}, false, err
 		}
-		return registry.RequestInfo{Package: pkg, Kind: "artifact", NeedsDecision: true}, false, nil
+		route, _ := s.routeForEcosystem(pkg.Ecosystem)
+		return route, registry.RequestInfo{Package: pkg, Kind: "artifact", NeedsDecision: true}, false, nil
 	}
 	raw := query.Get("url")
 	if raw == "" {
-		return registry.RequestInfo{}, false, errors.New("pass url=<the URL the package manager failed on> or purl=<package URL>")
+		return config.RouteConfig{}, registry.RequestInfo{}, false, errors.New("pass url=<the URL the package manager failed on> or purl=<package URL>")
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return registry.RequestInfo{}, false, fmt.Errorf("invalid url: %w", err)
+		return config.RouteConfig{}, registry.RequestInfo{}, false, fmt.Errorf("invalid url: %w", err)
 	}
 	route, matched := s.matchRoute(parsed.Path)
 	if !matched {
 		route, matched = s.matchNPMTarballFallback(parsed.Path)
 	}
 	if !matched {
-		return registry.RequestInfo{}, false, errors.New("no package firewall route matches the url path")
+		return config.RouteConfig{}, registry.RequestInfo{}, false, errors.New("no package firewall route matches the url path")
 	}
-	return registry.Identify(toRegistryRoute(route), parsed.Path), route.AllowAnonymous, nil
+	return route, registry.Identify(toRegistryRoute(route), parsed.Path), route.AllowAnonymous, nil
+}
+
+// A purl names no route, so its publish time comes from the first route that
+// proxies its ecosystem.
+func (s *Server) routeForEcosystem(ecosystem string) (config.RouteConfig, bool) {
+	for _, route := range s.cfg.Routes {
+		if route.Ecosystem == ecosystem {
+			return route, true
+		}
+	}
+	return config.RouteConfig{}, false
 }
 
 func proxyErrorStatus(err error) int {
@@ -327,11 +344,21 @@ func upstreamErrorResponse(err error) (int, string, string) {
 	return http.StatusBadGateway, "upstream_error", "upstream request failed"
 }
 
-func (s *Server) decide(ctx context.Context, info registry.RequestInfo) policy.Decision {
+func (s *Server) decide(ctx context.Context, route config.RouteConfig, info registry.RequestInfo) policy.Decision {
 	if !info.NeedsDecision {
 		return policy.Decision{Action: policy.ActionAllow, Reason: "metadata request"}
 	}
 	policyDecision := s.policy.Evaluate(info.Package)
+	// The publish time costs an upstream lookup, so it is fetched only when the
+	// cooldown is the one check left that could still block.
+	if policyDecision.Action == policy.ActionAllow && policyDecision.MatchedRule == "" && s.policy.CooldownEnabled() && info.Package.PublishedAt.IsZero() {
+		published, err := s.release.PublishedAt(ctx, toRegistryRoute(route), info)
+		if err != nil {
+			return s.lookupFailed("release date", err)
+		}
+		info.Package.PublishedAt = published
+		policyDecision = s.policy.Evaluate(info.Package)
+	}
 	switch policyDecision.Action {
 	case policy.ActionBlock, policy.ActionWarn, policy.ActionMonitor:
 		return policyDecision
@@ -350,16 +377,20 @@ func (s *Server) decide(ctx context.Context, info registry.RequestInfo) policy.D
 	}
 	result, err := s.intel.Query(ctx, info.Package)
 	if err != nil {
-		if s.cfg.Decision.FailOpenIntelErrors {
-			return policy.Decision{Action: policy.ActionWarn, Reason: "intel error allowed by fail_open_intel_errors: " + err.Error(), Kind: policy.KindIntelError}
-		}
-		return policy.Decision{Action: policy.ActionBlock, Reason: "intel error blocked by fail_open_intel_errors=false: " + err.Error(), Kind: policy.KindIntelError}
+		return s.lookupFailed("intel", err)
 	}
 	intelDecision := intel.Decide(result, policy.Action(s.cfg.Decision.DefaultVulnerabilityAction), s.cfg.Decision.VulnerabilityBlockThreshold)
 	if intelDecision.Action == policy.ActionAllow {
 		return policy.Decision{Action: policy.ActionAllow, Reason: "policy and intel allowed package"}
 	}
 	return intelDecision
+}
+
+func (s *Server) lookupFailed(what string, err error) policy.Decision {
+	if s.cfg.Decision.FailOpenIntelErrors {
+		return policy.Decision{Action: policy.ActionWarn, Reason: what + " error allowed by fail_open_intel_errors: " + err.Error(), Kind: policy.KindIntelError}
+	}
+	return policy.Decision{Action: policy.ActionBlock, Reason: what + " error blocked by fail_open_intel_errors=false: " + err.Error(), Kind: policy.KindIntelError}
 }
 
 func (s *Server) matchRoute(path string) (config.RouteConfig, bool) {

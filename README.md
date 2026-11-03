@@ -74,6 +74,22 @@ allow:
 
 Explicit deny rules take precedence over allow and warn rules. Explicit allow rules skip OSV checks. Unmatched package versions are checked against OSV when enabled. Go `.info` and `.mod` resolution metadata still evaluates explicit local policy and skips OSV; canonical versioned metadata is cached as immutable, while mutable selectors are not. `.zip` module archives remain evaluated.
 
+`cooldown` blocks a version until `min_age` after it was published:
+
+```yaml
+cooldown:
+  enabled: true
+  min_age: 24h
+```
+
+The publish time is looked up from the route's upstream only when no rule
+matched and the cooldown is enabled. npm uses the packument's `time`, PyPI
+the requested file's `upload-time` from the JSON simple index (PEP 691/700),
+so a new file on an old release is held too, Go the version's `.info` `Time`,
+and Maven the artifact's `Last-Modified`. Lookups are cached; a failed lookup
+follows `decision.fail_open_intel_errors`. Static routes have no publish time
+and are not held.
+
 ## Why was my install blocked?
 
 A blocked download returns `403` with an explanation: the advisory and its CVE
@@ -117,6 +133,11 @@ or replace the dependency when none is published), an OSV `MAL-` malicious
 package (remove it and treat the machine as compromised), a deny rule, the
 release cooldown (allowed after a given time), an unidentifiable artifact path,
 and a failed vulnerability lookup when intel errors fail closed.
+
+A `MAL-` record (or an advisory that aliases one) is always blocked: these
+records carry no CVSS score, so `vulnerability_block_threshold` and
+`default_vulnerability_action` do not apply to them. Only an explicit `allow`
+policy rule, which is evaluated before vulnerability intel, can let one through.
 
 ## CLI
 

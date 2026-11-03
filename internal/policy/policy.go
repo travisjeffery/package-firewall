@@ -156,6 +156,11 @@ func New(cfg Config) (*Engine, error) {
 	return &Engine{rules: rules, cooldown: cfg.Cooldown}, errors.Join(errs...)
 }
 
+// CooldownEnabled reports whether Evaluate needs Package.PublishedAt.
+func (e *Engine) CooldownEnabled() bool {
+	return e.cooldown.Enabled
+}
+
 func (e *Engine) Evaluate(pkg Package) Decision {
 	if pkg.PURL == "" {
 		return Decision{Action: ActionUnknown, Reason: "package version could not be identified", Kind: KindUnknownPackage}

@@ -134,8 +134,10 @@ package (remove it and treat the machine as compromised), a deny rule, the
 release cooldown (allowed after a given time), an unidentifiable artifact path,
 and a failed vulnerability lookup when intel errors fail closed.
 
-A `MAL-` record (or an advisory that aliases one) is always blocked: these
-records carry no CVSS score, so `vulnerability_block_threshold` and
+A malicious package is always blocked: an OSV `MAL-` record, an advisory that
+aliases one, or a GitHub advisory tagged CWE-506 (embedded malicious code),
+which often has neither a `MAL-` record nor a severity. These records usually
+carry no CVSS score, so `vulnerability_block_threshold` and
 `default_vulnerability_action` do not apply to them, and neither does a
 matching `warn` rule or a wildcard `allow` rule. The only way to serve one,
 for a verified false positive, is an `allow` rule naming the exact version

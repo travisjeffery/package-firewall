@@ -220,3 +220,23 @@ func TestOSVProviderKeepsAKnownMaliciousResultThroughAnOutage(t *testing.T) {
 		t.Fatal("a later clean answer must drop the retained malicious result")
 	}
 }
+
+// The shape OSV returns for coa@2.0.3: GitHub malware with no severity and no
+// MAL- alias, identified only by CWE-506.
+func TestOSVProviderBlocksUnscoredGitHubMalware(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"vulns":[{"id":"GHSA-73qr-pfmq-6rp8","summary":"Embedded malware in coa",
+			"database_specific":{"severity":"CRITICAL","github_reviewed":true,"cwe_ids":["CWE-506"]},
+			"affected":[{"package":{"name":"coa","ecosystem":"npm"},"versions":["2.0.3","2.0.4","2.1.1","2.1.3","3.0.1","3.1.3"]}]}]}`)
+	}))
+	defer server.Close()
+
+	result, err := NewOSVProvider(server.URL, time.Second, time.Minute).Query(context.Background(), policy.Package{Ecosystem: "npm", Name: "coa", Version: "2.0.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := Decide(result, policy.ActionWarn, 9.0)
+	if decision.Action != policy.ActionBlock || decision.Kind != policy.KindMalware || decision.Reason != "malicious package GHSA-73qr-pfmq-6rp8" {
+		t.Fatalf("decision = %+v", decision)
+	}
+}

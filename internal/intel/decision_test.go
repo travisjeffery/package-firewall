@@ -45,6 +45,7 @@ func TestDecideBlocksMaliciousPackagesWhateverTheSeverityAndDefaultAction(t *tes
 		{"threshold disabled", []Finding{{ID: "MAL-2026-1"}}, policy.ActionWarn, 0},
 		{"behind a scored finding", []Finding{{ID: "GHSA-a", Severity: 9.8}, {ID: "MAL-2026-1"}}, policy.ActionWarn, 9.0},
 		{"GHSA aliasing a MAL record", []Finding{{ID: "GHSA-m", Aliases: []string{"MAL-2026-1"}}}, policy.ActionWarn, 9.0},
+		{"unscored GHSA embedded malware", []Finding{{ID: "GHSA-73qr-pfmq-6rp8", CWEs: []string{"CWE-506"}}}, policy.ActionWarn, 9.0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			decision := Decide(Result{Findings: tt.findings}, tt.action, tt.threshold)
@@ -69,5 +70,12 @@ func TestDecideUsesDefaultActionBelowThreshold(t *testing.T) {
 	decision := Decide(Result{Findings: []Finding{{ID: "OSV-1", Severity: 5.0}}}, policy.ActionWarn, 9.0)
 	if decision.Action != policy.ActionWarn {
 		t.Fatalf("action = %s", decision.Action)
+	}
+}
+
+func TestMalwareBlockReasonNamesTheMALRecordBehindAnAlias(t *testing.T) {
+	decision := Decide(Result{Findings: []Finding{{ID: "GHSA-m", Aliases: []string{"CVE-1", "MAL-2026-1"}}}}, policy.ActionWarn, 9.0)
+	if decision.Reason != "malicious package GHSA-m (MAL-2026-1)" {
+		t.Fatalf("reason = %q", decision.Reason)
 	}
 }

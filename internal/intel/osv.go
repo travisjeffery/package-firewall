@@ -119,6 +119,7 @@ func (p *OSVProvider) fetch(ctx context.Context, ecosystem, name, version string
 		result.Findings = append(result.Findings, Finding{
 			ID:       vuln.ID,
 			Aliases:  vuln.Aliases,
+			CWEs:     vuln.DatabaseSpecific.CWEIDs,
 			Summary:  vuln.Summary,
 			Severity: maxSeverity(vuln.Severity),
 			Affected: affected,
@@ -335,6 +336,10 @@ type osvVulnerability struct {
 	Severity  []osvSeverity `json:"severity"`
 	Affected  []osvAffected `json:"affected"`
 	Withdrawn *time.Time    `json:"withdrawn"`
+	// GitHub's advisories carry their CWEs here.
+	DatabaseSpecific struct {
+		CWEIDs []string `json:"cwe_ids"`
+	} `json:"database_specific"`
 }
 
 type osvAffected struct {

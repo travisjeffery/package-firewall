@@ -2,6 +2,7 @@ package intel
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/travisjeffery/package-firewall/internal/policy"
@@ -55,9 +56,13 @@ func Decide(result Result, defaultAction policy.Action, blockThreshold float64) 
 func MalwareDecision(result Result, blockThreshold float64) (policy.Decision, bool) {
 	for _, finding := range result.Findings {
 		if malicious(finding) {
+			reason := "malicious package " + finding.ID
+			if mal := malAlias(finding); mal != "" && mal != finding.ID {
+				reason += " (" + mal + ")"
+			}
 			return policy.Decision{
 				Action:   policy.ActionBlock,
-				Reason:   "malicious package " + finding.ID,
+				Reason:   reason,
 				Kind:     policy.KindMalware,
 				Advisory: advisory(finding, blockThreshold),
 			}, true
@@ -66,18 +71,24 @@ func MalwareDecision(result Result, blockThreshold float64) (policy.Decision, bo
 	return policy.Decision{}, false
 }
 
-// OSV publishes the OpenSSF malicious-packages feed under the MAL- prefix.
-// A GHSA malware advisory can be returned in place of the MAL- record it aliases.
+// OSV publishes the OpenSSF malicious-packages feed under the MAL- prefix. A
+// GitHub malware advisory may alias that record, or carry no MAL- record and
+// no severity at all, only CWE-506 (embedded malicious code), as coa@2.0.3's
+// GHSA-73qr-pfmq-6rp8 does.
 func malicious(finding Finding) bool {
+	return malAlias(finding) != "" || slices.Contains(finding.CWEs, "CWE-506")
+}
+
+func malAlias(finding Finding) string {
 	if strings.HasPrefix(finding.ID, "MAL-") {
-		return true
+		return finding.ID
 	}
 	for _, alias := range finding.Aliases {
 		if strings.HasPrefix(alias, "MAL-") {
-			return true
+			return alias
 		}
 	}
-	return false
+	return ""
 }
 
 func findingKind(finding Finding) policy.BlockKind {

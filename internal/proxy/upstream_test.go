@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/config"
 )
 
 func TestProxyLimitsConcurrencyPerUpstreamRegistry(t *testing.T) {

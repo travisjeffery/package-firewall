@@ -190,7 +190,7 @@ func (m *Metrics) WriteTo(writer io.Writer) (int64, error) {
 
 func writeRequests(writer io.Writer, values map[requestKey]uint64) {
 	const name = "package_firewall_http_requests_total"
-	_, _ = fmt.Fprintf(writer, "# HELP %s Package Firewall responses by route and HTTP status.\n# TYPE %s counter\n", name, name)
+	_, _ = fmt.Fprintf(writer, "# HELP %s Tidewaiter responses by route and HTTP status.\n# TYPE %s counter\n", name, name)
 	keys := make([]requestKey, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)

@@ -10,7 +10,7 @@ Pin the module source to a package-firewall release tag:
 
 ```hcl
 module "package_firewall_cache" {
-  source = "git::https://github.com/travisjeffery/package-firewall.git//deploy/opentofu/modules/s3-cache?ref=vX.Y.Z"
+  source = "git::https://github.com/travisjeffery/tidewaiter.git//deploy/opentofu/modules/s3-cache?ref=vX.Y.Z"
 
   bucket_name    = "company-package-firewall-cache"
   cache_prefix   = "artifacts"
@@ -29,7 +29,7 @@ provider requirements but does not contain a provider block or lock file.
 
 ```hcl
 module "package_firewall_cache" {
-  source = "git::https://github.com/travisjeffery/package-firewall.git//deploy/opentofu/modules/s3-cache?ref=vX.Y.Z"
+  source = "git::https://github.com/travisjeffery/tidewaiter.git//deploy/opentofu/modules/s3-cache?ref=vX.Y.Z"
 
   create_bucket             = false
   existing_bucket_name      = aws_s3_bucket.shared.id

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 func TestDecideBlocksOnTheMostSevereFindingOverThreshold(t *testing.T) {

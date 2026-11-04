@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 func TestOSVProviderRejectsOversizedSuccessResponse(t *testing.T) {

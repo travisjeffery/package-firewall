@@ -387,7 +387,7 @@ type rateLimitError struct {
 }
 
 func (e *rateLimitError) Error() string {
-	return fmt.Sprintf("package firewall returned 429 with Retry-After %q", e.Header)
+	return fmt.Sprintf("Tidewaiter returned 429 with Retry-After %q", e.Header)
 }
 
 func rateLimitBackoff(attempt int) time.Duration {
@@ -445,7 +445,7 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPa
 	}
 	if err != nil {
 		event.Outcome = "transport_error"
-		return "", false, fmt.Errorf("request package firewall: %w", err)
+		return "", false, fmt.Errorf("request Tidewaiter: %w", err)
 	}
 	defer response.Body.Close()
 	headers = time.Now()
@@ -467,7 +467,7 @@ func fetchArtifactFromRoute(ctx context.Context, cfg RunConfig, pacer *requestPa
 			delay, valid := retryAfterDelay(header, time.Now())
 			return "", false, &rateLimitError{Delay: delay, Valid: valid, Header: header}
 		}
-		return "", false, fmt.Errorf("package firewall returned HTTP %d", response.StatusCode)
+		return "", false, fmt.Errorf("Tidewaiter returned HTTP %d", response.StatusCode)
 	}
 	hasher := sha256.New()
 	event.Outcome = "body_error"
@@ -516,7 +516,7 @@ func unavailableArtifactsError(artifacts []Artifact) error {
 		values = append(values, coordinate)
 	}
 	sort.Strings(values)
-	return fmt.Errorf("%d artifacts across %d coordinates are unavailable from configured Package Firewall routes: %s", len(artifacts), len(values), strings.Join(values, ", "))
+	return fmt.Errorf("%d artifacts across %d coordinates are unavailable from configured Tidewaiter routes: %s", len(artifacts), len(values), strings.Join(values, ", "))
 }
 
 func containsChecksum(checksums []string, actual string) bool {

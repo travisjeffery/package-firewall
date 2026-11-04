@@ -5,7 +5,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/config"
 )
 
 // replacement points one download origin in registry metadata back at the firewall.

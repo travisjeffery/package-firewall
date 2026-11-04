@@ -3,5 +3,6 @@
 /bin/
 /dist/
 /coverage.out
+/tidewaiter
 /package-firewall
 /pfw

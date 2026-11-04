@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
 )
 
 func registryServer(t *testing.T) (*httptest.Server, *int) {

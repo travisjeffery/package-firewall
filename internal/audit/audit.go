@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 type Logger struct {

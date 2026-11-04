@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 // Regression for the severity-parsing bug: OSV reports CVSS *vector strings*, but

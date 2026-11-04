@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
 )
 
 func TestProxyCachesPublicNPMArtifactsWithCDNCookies(t *testing.T) {

@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/explain"
-	"github.com/travisjeffery/package-firewall/internal/intel"
-	"github.com/travisjeffery/package-firewall/internal/policy"
-	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/explain"
+	"github.com/travisjeffery/tidewaiter/internal/intel"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
 )
 
 type fakePublishTimes struct {

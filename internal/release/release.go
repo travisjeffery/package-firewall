@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/cache"
-	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/cache"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
 )
 
 const (

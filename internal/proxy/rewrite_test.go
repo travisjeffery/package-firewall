@@ -10,8 +10,8 @@ import (
 	"testing"
 	"testing/iotest"
 
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/registry"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/registry"
 )
 
 // The whole-body rewrite this replaced is the oracle: streaming must produce the

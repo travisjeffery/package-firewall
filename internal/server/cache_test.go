@@ -12,11 +12,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/artifactcache"
-	"github.com/travisjeffery/package-firewall/internal/config"
-	"github.com/travisjeffery/package-firewall/internal/intel"
-	"github.com/travisjeffery/package-firewall/internal/policy"
-	"github.com/travisjeffery/package-firewall/internal/proxy"
+	"github.com/travisjeffery/tidewaiter/internal/artifactcache"
+	"github.com/travisjeffery/tidewaiter/internal/config"
+	"github.com/travisjeffery/tidewaiter/internal/intel"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/proxy"
 )
 
 func TestPolicyAndIntelRunBeforeEveryCacheHit(t *testing.T) {

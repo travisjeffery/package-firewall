@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/travisjeffery/package-firewall/internal/policy"
+	"github.com/travisjeffery/tidewaiter/internal/policy"
 )
 
 type Explanation struct {
@@ -72,12 +72,12 @@ func message(e Explanation) string {
 	}
 	var b strings.Builder
 	if e.Blocked {
-		b.WriteString("Blocked by Package Firewall: ")
+		b.WriteString("Blocked by Tidewaiter: ")
 	} else if e.Action == string(policy.ActionAllow) {
-		fmt.Fprintf(&b, "Package Firewall allows %s: %s.", subject, e.Reason)
+		fmt.Fprintf(&b, "Tidewaiter allows %s: %s.", subject, e.Reason)
 		return b.String()
 	} else {
-		fmt.Fprintf(&b, "Package Firewall allows %s (action %s): ", subject, e.Action)
+		fmt.Fprintf(&b, "Tidewaiter allows %s (action %s): ", subject, e.Action)
 	}
 	b.WriteString(finding(e, subject))
 	if e.NextStep != "" {
